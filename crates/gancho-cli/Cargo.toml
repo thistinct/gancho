@@ -1,0 +1,14 @@
+[package]
+name = "gancho"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+gancho-card = { version = "0.1.0", path = "../gancho-card" }
+gancho-core = { version = "0.1.0", path = "../gancho-core" }
+rpassword = "7.5.4"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+x509-cert = "0.3.0"
