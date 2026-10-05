@@ -5,4 +5,4 @@ members = ["crates/gancho-core", "crates/gancho-card", "crates/gancho-cli"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/pepito2k/open-gancho"
+repository = "https://github.com/thistinct/gancho"
