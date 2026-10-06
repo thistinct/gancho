@@ -39,6 +39,10 @@ pub enum NativeError {
     NoReader,
     #[error("the smart card service is not running (on Linux, install and start pcscd)")]
     NoService,
+    #[error(
+        "the cédula is not responding; take it out of the reader, put it back in and try again"
+    )]
+    CardUnresponsive,
     #[error("another program is using the card; close it and try again")]
     CardBusy,
     #[error("no reader named like \"{0}\"")]
@@ -310,13 +314,39 @@ fn der_total_length(b: &[u8]) -> Option<usize> {
 
 /// PC/SC transport to a card in a reader.
 pub struct PcscTransport {
-    card: pcsc::Card,
+    /// Always `Some` until dropped.
+    card: Option<pcsc::Card>,
     buf: Vec<u8>,
 }
 
 impl Transport for PcscTransport {
     fn transmit(&mut self, apdu: &[u8]) -> Result<Vec<u8>, NativeError> {
-        Ok(self.card.transmit(apdu, &mut self.buf)?.to_vec())
+        let card = self.card.as_ref().expect("card used after drop");
+        Ok(card.transmit(apdu, &mut self.buf)?.to_vec())
+    }
+}
+
+impl Drop for PcscTransport {
+    /// Logs out without a hard reset. Re-selecting the IAS application clears
+    /// the verified PIN (as OpenSC's `cedulauy` driver relies on), so the card
+    /// can be left powered. A full reset, pcsc's default on drop, made some
+    /// readers on macOS stop answering the next connection. If the re-select
+    /// fails, fall back to the reset.
+    fn drop(&mut self) {
+        let Some(card) = self.card.take() else { return };
+        let mut apdu = vec![0x00, 0xA4, 0x04, 0x00, IAS_AID.len() as u8];
+        apdu.extend_from_slice(&IAS_AID);
+        let mut buf = [0u8; 258];
+        let logged_out = matches!(
+            card.transmit(&apdu, &mut buf),
+            Ok(resp) if resp.len() >= 2 && matches!(resp[resp.len() - 2], 0x90 | 0x61)
+        );
+        let disposition = if logged_out {
+            pcsc::Disposition::LeaveCard
+        } else {
+            pcsc::Disposition::ResetCard
+        };
+        let _ = card.disconnect(disposition);
     }
 }
 
@@ -464,16 +494,25 @@ fn connect_reader(ctx: &pcsc::Context, name: &CStr) -> Result<Card<PcscTransport
     // The signing flow is stateful (VERIFY, MSE, PSO:HASH, PSO:CDS), so the
     // connection is exclusive for its whole life: no other program can send
     // commands in between. Another program may hold the card briefly, so
-    // retry for a moment before giving up. Dropping the connection resets the
-    // card, which also clears the verified PIN.
+    // retry for a moment before giving up. A card that was just reset or
+    // powered up may also not answer at first. Dropping the connection logs
+    // out (see `PcscTransport`'s `Drop`).
     let mut attempt = 0;
     let card = loop {
         match ctx.connect(name, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
-            Err(pcsc::Error::SharingViolation) if attempt < CONNECT_RETRIES => {
+            Err(
+                pcsc::Error::SharingViolation
+                | pcsc::Error::UnresponsiveCard
+                | pcsc::Error::UnpoweredCard
+                | pcsc::Error::ResetCard,
+            ) if attempt < CONNECT_RETRIES => {
                 attempt += 1;
                 std::thread::sleep(CONNECT_RETRY_DELAY);
             }
             Err(pcsc::Error::SharingViolation) => return Err(NativeError::CardBusy),
+            Err(
+                pcsc::Error::UnresponsiveCard | pcsc::Error::UnpoweredCard | pcsc::Error::ResetCard,
+            ) => return Err(NativeError::CardUnresponsive),
             Err(pcsc::Error::NoSmartcard | pcsc::Error::RemovedCard) => {
                 return Err(NativeError::NoCard);
             }
@@ -481,7 +520,7 @@ fn connect_reader(ctx: &pcsc::Context, name: &CStr) -> Result<Card<PcscTransport
         }
     };
     Card::new(PcscTransport {
-        card,
+        card: Some(card),
         buf: vec![0; pcsc::MAX_BUFFER_SIZE_EXTENDED],
     })
 }
