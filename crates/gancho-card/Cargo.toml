@@ -6,4 +6,9 @@ edition = "2024"
 [dependencies]
 cryptoki = "0.12"
 gancho-core = { version = "0.1.0", path = "../gancho-core" }
+pcsc = "2.9"
+sha2 = "0.10"
 thiserror = "2.0.21"
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["sha2"] }
