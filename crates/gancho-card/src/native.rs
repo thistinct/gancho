@@ -43,7 +43,7 @@ pub enum NativeError {
     CardBusy,
     #[error("no reader named like \"{0}\"")]
     ReaderNotFound(String),
-    #[error("the card in the reader is not a cédula, or not one this tool knows: {0}")]
+    #[error("no reader holds a cédula this tool can use: {0}")]
     NotACedula(String),
     #[error("no card in the reader")]
     NoCard,
@@ -423,18 +423,34 @@ pub fn connect(reader: Option<&str>) -> Result<Card<PcscTransport>, NativeError>
     }
     candidates.sort_by_key(|r| !r.looks_like_cedula());
 
+    // An explicitly chosen reader reports its own error.
+    if reader.is_some() {
+        return connect_reader(&ctx, &candidates[0].name);
+    }
+    // Otherwise any failure on one reader (wrong card, card pulled out,
+    // transport error) moves on to the next, and is kept for the final
+    // message.
+    let single = candidates.len() == 1;
     let mut tried = Vec::new();
     for r in candidates {
         match connect_reader(&ctx, &r.name) {
-            Err(NativeError::Status {
-                what: "SELECT application",
-                sw,
-            }) => tried.push(format!(
-                "{} (card answered {sw:04X}, ATR {})",
+            Ok(card) => return Ok(card),
+            Err(
+                e @ NativeError::Status {
+                    what: "SELECT application",
+                    ..
+                },
+            ) => tried.push(format!(
+                "{}: {e} (ATR {})",
                 r.name.to_string_lossy(),
                 hex(&r.atr)
             )),
-            other => return other,
+            Err(e) if single => return Err(e),
+            Err(e) => tried.push(format!(
+                "{}: {e} (ATR {})",
+                r.name.to_string_lossy(),
+                hex(&r.atr)
+            )),
         }
     }
     Err(NativeError::NotACedula(tried.join("; ")))

@@ -60,7 +60,12 @@ fn main() -> Result<()> {
     };
     match backend {
         Backend::Native => run_native(cli.command, cli.reader.as_deref()),
-        Backend::Pkcs11 => run_pkcs11(cli.command, cli.module),
+        Backend::Pkcs11 => {
+            if cli.reader.is_some() {
+                bail!("--reader only works with the native backend");
+            }
+            run_pkcs11(cli.command, cli.module)
+        }
     }
 }
 
