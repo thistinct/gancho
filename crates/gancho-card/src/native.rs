@@ -339,7 +339,7 @@ impl Drop for PcscTransport {
         let mut buf = [0u8; 258];
         let logged_out = matches!(
             card.transmit(&apdu, &mut buf),
-            Ok(resp) if resp.len() >= 2 && matches!(resp[resp.len() - 2], 0x90 | 0x61)
+            Ok(resp) if matches!(resp, [.., 0x90, 0x00] | [.., 0x61, _])
         );
         let disposition = if logged_out {
             pcsc::Disposition::LeaveCard
