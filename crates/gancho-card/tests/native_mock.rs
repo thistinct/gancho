@@ -225,6 +225,15 @@ fn bad_pin_format_is_not_sent() {
         card.verify_pin("123456789"),
         Err(NativeError::PinFormat)
     ));
+    assert!(matches!(
+        card.verify_pin("abcd"),
+        Err(NativeError::PinFormat)
+    ));
+    assert!(matches!(
+        card.verify_pin("12 34"),
+        Err(NativeError::PinFormat)
+    ));
+    // No attempt reached the card: the retry counter is untouched.
     assert_eq!(card.pin_status().unwrap(), PinStatus::TriesLeft(3));
 }
 

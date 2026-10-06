@@ -29,6 +29,9 @@ const PIN_MIN_LEN: usize = 4;
 const PIN_MAX_LEN: usize = 8;
 /// READ BINARY chunk size.
 const READ_CHUNK: usize = 0xF8;
+/// How long to keep retrying when another program holds the card.
+const CONNECT_RETRIES: u32 = 10;
+const CONNECT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 
 #[derive(Debug, thiserror::Error)]
 pub enum NativeError {
@@ -36,9 +39,11 @@ pub enum NativeError {
     NoReader,
     #[error("the smart card service is not running (on Linux, install and start pcscd)")]
     NoService,
+    #[error("another program is using the card; close it and try again")]
+    CardBusy,
     #[error("no card in the reader")]
     NoCard,
-    #[error("the PIN must be {PIN_MIN_LEN} to {PIN_MAX_LEN} characters")]
+    #[error("the PIN must be {PIN_MIN_LEN} to {PIN_MAX_LEN} digits")]
     PinFormat,
     #[error("wrong PIN, {0} tries left")]
     WrongPin(u8),
@@ -190,7 +195,8 @@ impl<T: Transport> Card<T> {
     /// and refuses to spend the last remaining try.
     pub fn verify_pin(&mut self, pin: &str) -> Result<(), NativeError> {
         let pin = pin.as_bytes();
-        if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&pin.len()) {
+        if !(PIN_MIN_LEN..=PIN_MAX_LEN).contains(&pin.len()) || !pin.iter().all(u8::is_ascii_digit)
+        {
             return Err(NativeError::PinFormat);
         }
         match self.pin_status()? {
@@ -202,9 +208,9 @@ impl<T: Transport> Card<T> {
         let mut apdu = vec![0x00, 0x20, 0x00, PIN_REF, PIN_PADDED_LEN as u8];
         apdu.extend_from_slice(pin);
         apdu.resize(5 + PIN_PADDED_LEN, 0x00);
-        let resp = self.send(&apdu)?;
+        let resp = self.send(&apdu);
         apdu.fill(0);
-        match resp.sw {
+        match resp?.sw {
             0x9000 => Ok(()),
             0x6983 => Err(NativeError::PinBlocked),
             sw if sw & 0xFFF0 == 0x63C0 => Err(NativeError::WrongPin((sw & 0x0F) as u8)),
@@ -363,18 +369,25 @@ pub fn connect(reader: Option<&CStr>) -> Result<Card<PcscTransport>, NativeError
                 .name
         }
     };
-    // Exclusive access keeps other software from selecting another applet
-    // between our VERIFY and the signature; fall back to shared if busy.
-    let card = match ctx.connect(&name, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
-        Err(pcsc::Error::SharingViolation) => {
-            ctx.connect(&name, pcsc::ShareMode::Shared, pcsc::Protocols::ANY)
+    // The signing flow is stateful (VERIFY, MSE, PSO:HASH, PSO:CDS), so the
+    // connection is exclusive for its whole life: no other program can send
+    // commands in between. Another program may hold the card briefly, so
+    // retry for a moment before giving up. Dropping the connection resets the
+    // card, which also clears the verified PIN.
+    let mut attempt = 0;
+    let card = loop {
+        match ctx.connect(&name, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
+            Err(pcsc::Error::SharingViolation) if attempt < CONNECT_RETRIES => {
+                attempt += 1;
+                std::thread::sleep(CONNECT_RETRY_DELAY);
+            }
+            Err(pcsc::Error::SharingViolation) => return Err(NativeError::CardBusy),
+            Err(pcsc::Error::NoSmartcard | pcsc::Error::RemovedCard) => {
+                return Err(NativeError::NoCard);
+            }
+            other => break other?,
         }
-        other => other,
-    }
-    .map_err(|e| match e {
-        pcsc::Error::NoSmartcard | pcsc::Error::RemovedCard => NativeError::NoCard,
-        e => e.into(),
-    })?;
+    };
     Card::new(PcscTransport {
         card,
         buf: vec![0; pcsc::MAX_BUFFER_SIZE_EXTENDED],
