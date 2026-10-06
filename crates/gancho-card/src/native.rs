@@ -41,6 +41,10 @@ pub enum NativeError {
     NoService,
     #[error("another program is using the card; close it and try again")]
     CardBusy,
+    #[error("no reader named like \"{0}\"")]
+    ReaderNotFound(String),
+    #[error("no reader holds a cédula this tool can use: {0}")]
+    NotACedula(String),
     #[error("no card in the reader")]
     NoCard,
     #[error("the PIN must be {PIN_MIN_LEN} to {PIN_MAX_LEN} digits")]
@@ -316,11 +320,41 @@ impl Transport for PcscTransport {
     }
 }
 
+/// ATR of the cédula with the per-batch bytes masked out, as in OpenSC's
+/// `cedulauy` driver.
+const CEDULA_ATR: [u8; 20] = [
+    0x3B, 0x7F, 0x94, 0x00, 0x00, 0x80, 0x31, 0x80, 0x65, 0xB0, 0x85, 0x03, 0x00, 0xEF, 0x12, 0x0F,
+    0xFF, 0x82, 0x90, 0x00,
+];
+const CEDULA_ATR_MASK: [u8; 20] = [
+    0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xFF, 0xFF, 0xFF,
+];
+
+/// Whether `atr` matches the known cédula ATR pattern. A mismatch is only a
+/// hint: the application is still tried, since new batches may differ.
+pub fn atr_looks_like_cedula(atr: &[u8]) -> bool {
+    atr.len() == CEDULA_ATR.len()
+        && atr
+            .iter()
+            .zip(CEDULA_ATR_MASK)
+            .zip(CEDULA_ATR)
+            .all(|((a, m), want)| a & m == want & m)
+}
+
 /// A reader known to the PC/SC service.
 #[derive(Debug, Clone)]
 pub struct Reader {
     pub name: CString,
     pub has_card: bool,
+    /// ATR of the inserted card (empty when there is none).
+    pub atr: Vec<u8>,
+}
+
+impl Reader {
+    pub fn looks_like_cedula(&self) -> bool {
+        atr_looks_like_cedula(&self.atr)
+    }
 }
 
 fn context() -> Result<pcsc::Context, NativeError> {
@@ -330,7 +364,7 @@ fn context() -> Result<pcsc::Context, NativeError> {
     })
 }
 
-/// Lists readers and whether each has a card inserted.
+/// Lists readers, whether each has a card inserted, and its ATR.
 pub fn readers() -> Result<Vec<Reader>, NativeError> {
     let ctx = context()?;
     let names = match ctx.list_readers_owned() {
@@ -346,29 +380,87 @@ pub fn readers() -> Result<Vec<Reader>, NativeError> {
     Ok(names
         .into_iter()
         .zip(states)
-        .map(|(name, st)| Reader {
-            name,
-            has_card: st.event_state().contains(pcsc::State::PRESENT),
+        .map(|(name, st)| {
+            let has_card = st.event_state().contains(pcsc::State::PRESENT);
+            Reader {
+                name,
+                has_card,
+                atr: if has_card {
+                    st.atr().to_vec()
+                } else {
+                    Vec::new()
+                },
+            }
         })
         .collect())
 }
 
-/// Connects to the cédula in `reader`, or in the first reader that has a card.
-pub fn connect(reader: Option<&CStr>) -> Result<Card<PcscTransport>, NativeError> {
+/// Connects to the cédula. With `reader`, uses the first reader whose name
+/// contains it; otherwise tries every reader with a card (those whose ATR
+/// looks like a cédula first) and keeps the one that has the IAS application.
+/// Other cards in other readers (a YubiKey, a bank card) are skipped.
+pub fn connect(reader: Option<&str>) -> Result<Card<PcscTransport>, NativeError> {
     let ctx = context()?;
-    let name = match reader {
-        Some(r) => r.to_owned(),
-        None => {
-            let all = readers()?;
-            if all.is_empty() {
-                return Err(NativeError::NoReader);
+    let all = readers()?;
+    if all.is_empty() {
+        return Err(NativeError::NoReader);
+    }
+    let mut candidates: Vec<Reader> = match reader {
+        Some(want) => {
+            let r = all
+                .into_iter()
+                .find(|r| r.name.to_string_lossy().contains(want))
+                .ok_or_else(|| NativeError::ReaderNotFound(want.to_owned()))?;
+            if !r.has_card {
+                return Err(NativeError::NoCard);
             }
-            all.into_iter()
-                .find(|r| r.has_card)
-                .ok_or(NativeError::NoCard)?
-                .name
+            vec![r]
         }
+        None => all.into_iter().filter(|r| r.has_card).collect(),
     };
+    if candidates.is_empty() {
+        return Err(NativeError::NoCard);
+    }
+    candidates.sort_by_key(|r| !r.looks_like_cedula());
+
+    // An explicitly chosen reader reports its own error.
+    if reader.is_some() {
+        return connect_reader(&ctx, &candidates[0].name);
+    }
+    // Otherwise any failure on one reader (wrong card, card pulled out,
+    // transport error) moves on to the next, and is kept for the final
+    // message.
+    let single = candidates.len() == 1;
+    let mut tried = Vec::new();
+    for r in candidates {
+        match connect_reader(&ctx, &r.name) {
+            Ok(card) => return Ok(card),
+            Err(
+                e @ NativeError::Status {
+                    what: "SELECT application",
+                    ..
+                },
+            ) => tried.push(format!(
+                "{}: {e} (ATR {})",
+                r.name.to_string_lossy(),
+                hex(&r.atr)
+            )),
+            Err(e) if single => return Err(e),
+            Err(e) => tried.push(format!(
+                "{}: {e} (ATR {})",
+                r.name.to_string_lossy(),
+                hex(&r.atr)
+            )),
+        }
+    }
+    Err(NativeError::NotACedula(tried.join("; ")))
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02X}")).collect()
+}
+
+fn connect_reader(ctx: &pcsc::Context, name: &CStr) -> Result<Card<PcscTransport>, NativeError> {
     // The signing flow is stateful (VERIFY, MSE, PSO:HASH, PSO:CDS), so the
     // connection is exclusive for its whole life: no other program can send
     // commands in between. Another program may hold the card briefly, so
@@ -376,7 +468,7 @@ pub fn connect(reader: Option<&CStr>) -> Result<Card<PcscTransport>, NativeError
     // card, which also clears the verified PIN.
     let mut attempt = 0;
     let card = loop {
-        match ctx.connect(&name, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
+        match ctx.connect(name, pcsc::ShareMode::Exclusive, pcsc::Protocols::ANY) {
             Err(pcsc::Error::SharingViolation) if attempt < CONNECT_RETRIES => {
                 attempt += 1;
                 std::thread::sleep(CONNECT_RETRY_DELAY);
