@@ -26,11 +26,15 @@ pub fn candidate_modules() -> &'static [&'static str] {
     if cfg!(target_os = "windows") {
         &[
             r"C:\Windows\System32\gclib.dll",
+            r"C:\Windows\SysWOW64\gclib.dll",
+            r"C:\Program Files\Gemalto\Classic Client\BIN\gclib.dll",
+            r"C:\Program Files\OpenSC Project\OpenSC\pkcs11\opensc-pkcs11.dll",
             r"C:\Windows\System32\opensc-pkcs11.dll",
         ]
     } else if cfg!(target_os = "macos") {
         &[
             "/usr/local/lib/ClassicClient/libgclib.dylib",
+            "/usr/local/lib/libgclib.dylib",
             "/Library/Frameworks/eToken.framework/Versions/Current/libeToken.dylib",
             "/Library/OpenSC/lib/opensc-pkcs11.so",
             "/opt/homebrew/lib/opensc-pkcs11.so",
@@ -40,9 +44,16 @@ pub fn candidate_modules() -> &'static [&'static str] {
             "/usr/lib/libgclib.so",
             "/usr/lib/pkcs11/libgclib.so",
             "/usr/lib/ClassicClient/libgclib.so",
+            "/usr/lib64/libgclib.so",
+            "/usr/lib64/pkcs11/libgclib.so",
+            "/usr/local/lib/libgclib.so",
             "/usr/lib/x86_64-linux-gnu/opensc-pkcs11.so",
+            "/usr/lib/x86_64-linux-gnu/pkcs11/opensc-pkcs11.so",
+            "/usr/lib/aarch64-linux-gnu/opensc-pkcs11.so",
+            "/usr/lib64/opensc-pkcs11.so",
             "/usr/lib/opensc-pkcs11.so",
             "/usr/lib/pkcs11/opensc-pkcs11.so",
+            "/usr/local/lib/opensc-pkcs11.so",
         ]
     }
 }
@@ -60,8 +71,14 @@ pub fn find_module() -> Option<PathBuf> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CardError {
-    #[error("no PKCS#11 module found; install the cédula middleware or set {MODULE_ENV}")]
+    #[error(
+        "no PKCS#11 module found; install the cédula middleware (Classic Client) \
+         or set {MODULE_ENV} to the driver's path. Looked in:\n  {}",
+        candidate_modules().join("\n  ")
+    )]
     NoModule,
+    #[error("PKCS#11 module {0} does not exist")]
+    ModuleMissing(PathBuf),
     #[error("no card found in any reader")]
     NoCard,
     #[error("no signing certificate with a matching private key on the card")]
@@ -95,6 +112,9 @@ pub struct Credential {
 
 impl Module {
     pub fn load(path: &Path) -> Result<Self, CardError> {
+        if !path.exists() {
+            return Err(CardError::ModuleMissing(path.to_owned()));
+        }
         let ctx = Pkcs11::new(path)?;
         ctx.initialize(CInitializeArgs::new(CInitializeFlags::OS_LOCKING_OK))?;
         Ok(Self { ctx })
