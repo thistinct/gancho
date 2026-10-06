@@ -27,6 +27,10 @@ struct Cli {
     /// $GANCHO_PKCS11_MODULE or a known install path).
     #[arg(long, global = true)]
     module: Option<PathBuf>,
+    /// Card reader to use (any part of its name, as shown by `devices`).
+    /// By default every reader with a card is tried.
+    #[arg(long, global = true)]
+    reader: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -55,12 +59,12 @@ fn main() -> Result<()> {
         cli.backend
     };
     match backend {
-        Backend::Native => run_native(cli.command),
+        Backend::Native => run_native(cli.command, cli.reader.as_deref()),
         Backend::Pkcs11 => run_pkcs11(cli.command, cli.module),
     }
 }
 
-fn run_native(command: Command) -> Result<()> {
+fn run_native(command: Command, reader: Option<&str>) -> Result<()> {
     match command {
         Command::Devices => {
             let readers = native::readers()?;
@@ -68,16 +72,20 @@ fn run_native(command: Command) -> Result<()> {
                 bail!("no smart card reader found; is the reader plugged in?");
             }
             for r in readers {
-                let state = if r.has_card { "card inserted" } else { "empty" };
+                let state = match (r.has_card, r.looks_like_cedula()) {
+                    (false, _) => "empty".to_owned(),
+                    (true, true) => format!("cédula, ATR {}", hex(&r.atr)),
+                    (true, false) => format!("card inserted, ATR {}", hex(&r.atr)),
+                };
                 println!("{}  ({state})", r.name.to_string_lossy());
             }
         }
         Command::Certs => {
-            let mut card = native::connect(None)?;
+            let mut card = native::connect(reader)?;
             print_certificate(None, &card.certificate()?)?;
         }
         Command::SelfTest => {
-            let mut card = native::connect(None)?;
+            let mut card = native::connect(reader)?;
             match card.pin_status()? {
                 PinStatus::TriesLeft(n) => eprintln!("PIN tries left: {n}"),
                 PinStatus::Blocked => bail!("the PIN is blocked"),
@@ -125,6 +133,10 @@ fn run_pkcs11(command: Command, module_path: Option<PathBuf>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02X}")).collect()
 }
 
 fn print_certificate(label: Option<&str>, der: &[u8]) -> Result<()> {
