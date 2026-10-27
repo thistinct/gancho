@@ -4,6 +4,10 @@
 //! which is in turn certified by "AC Raíz Nacional de Uruguay" (ACRN, run by
 //! AGESIC/UCE). Embedding both in each signature lets a validator connect the
 //! signer to the national root without fetching anything.
+//!
+//! "Autoridad Certificadora TuID" (ANTEL) is bundled too, so signatures
+//! made with TuID, whose PDFs carry only the signer's certificate, can be
+//! traced to the same root.
 
 use der::{Decode, Encode};
 use rsa::RsaPublicKey;
@@ -14,12 +18,13 @@ use x509_cert::Certificate;
 use x509_cert::ext::pkix::BasicConstraints;
 
 /// CA certificates (DER) shipped with gancho: the Ministerio del Interior
-/// CA that issues cédula certificates, and the national root (ACRN). See
-/// `certs/README.md` for sources and fingerprints.
-pub const BUNDLED: &[&[u8]] = &[MINISTERIO_DEL_INTERIOR, RAIZ_NACIONAL];
+/// CA that issues cédula certificates, the TuID CA, and the national root
+/// (ACRN). See `certs/README.md` for sources and fingerprints.
+pub const BUNDLED: &[&[u8]] = &[MINISTERIO_DEL_INTERIOR, TUID, RAIZ_NACIONAL];
 
 pub const MINISTERIO_DEL_INTERIOR: &[u8] = include_bytes!("../certs/mica.der");
 pub const RAIZ_NACIONAL: &[u8] = include_bytes!("../certs/acrn.der");
+pub const TUID: &[u8] = include_bytes!("../certs/tuid.der");
 
 /// Bundled certificates that are roots (self-signed), for use as trust
 /// anchors.
@@ -189,14 +194,19 @@ mod tests {
             fingerprint(MINISTERIO_DEL_INTERIOR),
             "A29CAD5C89AA49CFF81F17F45C42FD44685510246D9AB5D031448E2FDA2517BE"
         );
+        assert_eq!(
+            fingerprint(TUID),
+            "F7C2D302FC18F29CAD0D2B60E4FC9EB564781F8D3F49693CE38C3B2CAE2F091E"
+        );
     }
 
     #[test]
-    fn ministerio_chains_to_the_national_root() {
+    fn intermediates_chain_to_the_national_root() {
         assert_eq!(bundled_roots(), vec![RAIZ_NACIONAL]);
         assert_eq!(
             issuer_chain(MINISTERIO_DEL_INTERIOR, BUNDLED),
             vec![RAIZ_NACIONAL.to_vec()]
         );
+        assert_eq!(issuer_chain(TUID, BUNDLED), vec![RAIZ_NACIONAL.to_vec()]);
     }
 }
