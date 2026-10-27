@@ -11,4 +11,4 @@ gancho-core = { version = "0.1.0", path = "../gancho-core" }
 rpassword = "7.5.4"
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
-x509-cert = "0.3.0"
+x509-cert = { version = "0.3.0", features = ["pem"] }

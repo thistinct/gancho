@@ -3,8 +3,10 @@
 //! The PDF/PAdES and CMS code lives here and only talks to a [`Signer`], so it
 //! can be tested with a software key and driven by the cédula in production.
 
+pub mod ca;
 pub mod cms;
 pub mod pdf;
+pub mod verify;
 
 /// Something that holds a certificate and can produce RSA PKCS#1 v1.5
 /// signatures with the matching private key.
