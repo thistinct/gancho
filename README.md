@@ -35,7 +35,7 @@ cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firma
 
 `sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid. The issuing CA certificates are embedded so readers can connect the signer to the national root.
 
-Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
+Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it). Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
 
 ```sh
 cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
@@ -53,6 +53,6 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 2. **PDF signing, PAdES-B-B** (done): `sign`. Incremental update with a signature field, `/ByteRange` placeholder, `/SubFilter /ETSI.CAdES.detached`; detached CMS SignedData with `contentType`, `messageDigest` and `signingCertificateV2` signed attributes (`cms`, `x509-cert`, `lopdf`).
 3. **Verification** (done): `verify`. Checks the CMS signature, the byte range, and the chain against the bundled ACRN and Ministerio del Interior CA certificates.
 4. **Timestamps** (done): `sign --tsa URL` (PAdES-B-T). **Long-term validation** next: a DSS dictionary with the chain and CRLs (PAdES-B-LT).
-5. **Visible signature** appearance.
+5. **Visible signature** (done): `sign --visible`.
 6. **Desktop app** (Tauri 2): pick file, show certificate, enter PIN, sign, verify.
 7. Packaging per OS, plus CAdES `.p7s` for arbitrary files.

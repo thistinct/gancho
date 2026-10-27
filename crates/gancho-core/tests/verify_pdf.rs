@@ -138,3 +138,50 @@ fn save_chain_signed_sample() {
         std::fs::write(std::path::Path::new(&dir).join("chain.pdf"), sign(SAMPLE)).unwrap();
     }
 }
+
+#[test]
+fn visible_signature_box() {
+    use gancho_core::appearance::Appearance;
+    let options = SignOptions {
+        reason: Some("Conformidad".into()),
+        location: Some("Montevideo".into()),
+        chain: issuer_chain(LEAF, &[ROOT, INTERMEDIATE]),
+        appearance: Some(Appearance::default()),
+        ..Default::default()
+    };
+    let signed = sign_pdf(SAMPLE, &mut signer(), &options).unwrap();
+    if let Some(dir) = std::env::var_os("GANCHO_TEST_OUT") {
+        std::fs::write(std::path::Path::new(&dir).join("visible.pdf"), &signed).unwrap();
+    }
+    assert!(verify_pdf(&signed, &[ROOT], &[]).unwrap()[0].is_valid());
+
+    let doc = lopdf::Document::load_mem(&signed).unwrap();
+    let widget = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .find(|d| d.get(b"FT").and_then(|o| o.as_name()).ok() == Some(b"Sig"))
+        .unwrap();
+    let rect: Vec<f32> = widget
+        .get(b"Rect")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_float().unwrap())
+        .collect();
+    assert_eq!(rect, [36.0, 36.0, 256.0, 106.0]);
+    let ap = widget
+        .get(b"AP")
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"N")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    let stream = doc.get_object(ap).unwrap().as_stream().unwrap();
+    let text = String::from_utf8_lossy(&stream.content);
+    assert!(text.contains("PRUEBA FIRMANTE"), "{text}");
+    assert!(text.contains("Motivo: Conformidad"));
+}

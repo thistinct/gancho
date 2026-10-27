@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gancho_card::native::{self, NativeSigner, PinStatus};
 use gancho_card::pkcs11::Module;
 use gancho_core::Signer;
+use gancho_core::appearance::Appearance;
 use gancho_core::ca;
 use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
 use gancho_core::tsp::TimestampAuthority;
@@ -87,10 +88,33 @@ struct SignArgs {
     /// signer's certificate. Can be repeated.
     #[arg(long = "ca", value_name = "FILE")]
     cas: Vec<PathBuf>,
+    /// Draw a visible signature box (bottom-left of the last page unless
+    /// --page or --rect say otherwise).
+    #[arg(long)]
+    visible: bool,
+    /// Page for the visible box, counting from 1 (implies --visible).
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    page: Option<u32>,
+    /// Box position in points from the lower-left corner of the page,
+    /// as x1,y1,x2,y2 (implies --visible).
+    #[arg(long, value_name = "X1,Y1,X2,Y2", value_parser = parse_rect)]
+    rect: Option<[f32; 4]>,
     /// RFC 3161 timestamp server to certify the signing time (PAdES-B-T),
     /// e.g. http://timestamp.digicert.com
     #[arg(long, value_name = "URL")]
     tsa: Option<String>,
+}
+
+fn parse_rect(s: &str) -> std::result::Result<[f32; 4], String> {
+    let nums: Vec<f32> = s
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().map_err(|e| format!("{p:?}: {e}")))
+        .collect::<std::result::Result<_, _>>()?;
+    match nums[..] {
+        [x1, y1, x2, y2] if x2 > x1 && y2 > y1 => Ok([x1, y1, x2, y2]),
+        [_, _, _, _] => Err("x2 must exceed x1 and y2 must exceed y1".into()),
+        _ => Err("expected four numbers: x1,y1,x2,y2".into()),
+    }
 }
 
 /// Talks to a timestamp server over HTTP(S).
@@ -241,6 +265,12 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         reason: args.reason.clone(),
         location: args.location.clone(),
         chain,
+        appearance: (args.visible || args.page.is_some() || args.rect.is_some()).then_some(
+            Appearance {
+                page: args.page,
+                rect: args.rect,
+            },
+        ),
         ..Default::default()
     };
     let mut tsa = args.tsa.as_deref().map(HttpTsa);

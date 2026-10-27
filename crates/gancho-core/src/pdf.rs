@@ -14,6 +14,7 @@ use lopdf::{Dictionary, Document, IncrementalDocument, Object, ObjectId, StringF
 use sha2::{Digest, Sha256};
 
 use crate::Signer;
+use crate::appearance::{self, Appearance};
 use crate::cms::{CmsError, signed_data_detached};
 use crate::tsp::TimestampAuthority;
 
@@ -33,6 +34,8 @@ pub enum PdfError {
     Encrypted,
     #[error("the PDF has no pages")]
     NoPages,
+    #[error("page {0} does not exist; the PDF has {1}")]
+    Page(u32, u32),
     #[error("unexpected PDF structure: {0}")]
     Structure(lopdf::Error),
     #[error("could not write the signed PDF: {0}")]
@@ -56,6 +59,8 @@ pub struct SignOptions {
     pub time: Option<SystemTime>,
     /// Extra certificates (DER) to embed, typically the issuing CA chain.
     pub chain: Vec<Vec<u8>>,
+    /// Draw a visible signature box; otherwise the signature is invisible.
+    pub appearance: Option<Appearance>,
 }
 
 /// Signs `input` and returns the signed PDF (PAdES-B-B).
@@ -80,7 +85,9 @@ pub fn sign_pdf_timestamped(
         return Err(PdfError::Encrypted);
     }
     let mut inc = IncrementalDocument::create_from(input.to_vec(), doc);
-    add_signature_objects(&mut inc, options).map_err(PdfError::Structure)?;
+    let time = options.time.unwrap_or_else(SystemTime::now);
+    let cert = signer.certificate_der().to_vec();
+    add_signature_objects(&mut inc, options, time, &cert)?;
 
     let mut out = Vec::with_capacity(input.len() + 2 * SIGNATURE_CAPACITY + 4096);
     inc.save_to(&mut out).map_err(PdfError::Write)?;
@@ -103,15 +110,58 @@ pub fn sign_pdf_timestamped(
 fn add_signature_objects(
     inc: &mut IncrementalDocument,
     options: &SignOptions,
-) -> lopdf::Result<()> {
+    time: SystemTime,
+    cert_der: &[u8],
+) -> Result<(), PdfError> {
     let prev = inc.get_prev_documents();
-    let root_id = prev.trailer.get(b"Root")?.as_reference()?;
-    let page_id = *prev
-        .get_pages()
-        .get(&1)
-        .ok_or(lopdf::Error::PageNumberNotFound(1))?;
+    let root_id = prev
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .map_err(PdfError::Structure)?;
+    let pages = prev.get_pages();
+    let page_count = pages.len() as u32;
+    let page_no = match &options.appearance {
+        Some(Appearance { page: Some(n), .. }) => *n,
+        Some(_) => page_count,
+        None => 1,
+    };
+    let page_id = *pages
+        .get(&page_no)
+        .ok_or(PdfError::Page(page_no, page_count))?;
     let field_name = unused_field_name(prev, root_id);
+    let rect = options.appearance.as_ref().map(|a| {
+        a.rect.unwrap_or_else(|| {
+            let [x, y, ..] = media_box(prev, page_id);
+            let m = appearance::DEFAULT_MARGIN;
+            let (w, h) = appearance::DEFAULT_SIZE;
+            [x + m, y + m, x + m + w, y + m + h]
+        })
+    });
+    add_objects(
+        inc,
+        options,
+        time,
+        cert_der,
+        root_id,
+        page_id,
+        &field_name,
+        rect,
+    )
+    .map_err(PdfError::Structure)
+}
 
+#[allow(clippy::too_many_arguments)]
+fn add_objects(
+    inc: &mut IncrementalDocument,
+    options: &SignOptions,
+    time: SystemTime,
+    cert_der: &[u8],
+    root_id: ObjectId,
+    page_id: ObjectId,
+    field_name: &str,
+    rect: Option<[f32; 4]>,
+) -> lopdf::Result<()> {
     let mut sig = Dictionary::new();
     sig.set("Type", Object::Name(b"Sig".to_vec()));
     sig.set("Filter", Object::Name(b"Adobe.PPKLite".to_vec()));
@@ -129,10 +179,7 @@ fn add_signature_objects(
         "Contents",
         Object::String(vec![0; SIGNATURE_CAPACITY], StringFormat::Hexadecimal),
     );
-    sig.set(
-        "M",
-        Object::string_literal(pdf_date(options.time.unwrap_or_else(SystemTime::now))),
-    );
+    sig.set("M", Object::string_literal(pdf_date(time)));
     if let Some(reason) = &options.reason {
         sig.set("Reason", text_string(reason));
     }
@@ -145,14 +192,39 @@ fn add_signature_objects(
     widget.set("Type", Object::Name(b"Annot".to_vec()));
     widget.set("Subtype", Object::Name(b"Widget".to_vec()));
     widget.set("FT", Object::Name(b"Sig".to_vec()));
-    widget.set("T", text_string(&field_name));
+    widget.set("T", text_string(field_name));
     widget.set("V", Object::Reference(sig_id));
     // Print | Locked
     widget.set("F", Object::Integer(4 | 128));
-    widget.set(
-        "Rect",
-        Object::Array(vec![0.into(), 0.into(), 0.into(), 0.into()]),
-    );
+    match rect {
+        Some([x1, y1, x2, y2]) => {
+            widget.set(
+                "Rect",
+                Object::Array(vec![x1.into(), y1.into(), x2.into(), y2.into()]),
+            );
+            let unix = time
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let lines = appearance::lines(
+                cert_der,
+                &crate::verify::format_utc(unix),
+                options.reason.as_deref(),
+                options.location.as_deref(),
+            );
+            let ap = inc.new_document.add_object(appearance::stream(
+                (x2 - x1).abs(),
+                (y2 - y1).abs(),
+                &lines,
+            ));
+            let mut ap_dict = Dictionary::new();
+            ap_dict.set("N", Object::Reference(ap));
+            widget.set("AP", Object::Dictionary(ap_dict));
+        }
+        None => widget.set(
+            "Rect",
+            Object::Array(vec![0.into(), 0.into(), 0.into(), 0.into()]),
+        ),
+    }
     widget.set("P", Object::Reference(page_id));
     let widget_id = inc.new_document.add_object(widget);
 
@@ -199,6 +271,31 @@ fn add_signature_objects(
         inc.new_document.trailer.remove(key);
     }
     Ok(())
+}
+
+/// The page's `/MediaBox`, which may be inherited from its parents; A4
+/// when absent.
+fn media_box(doc: &Document, page_id: ObjectId) -> [f32; 4] {
+    let mut node = doc.get_dictionary(page_id).ok();
+    for _ in 0..32 {
+        let Some(d) = node else { break };
+        if let Ok(arr) = d
+            .get(b"MediaBox")
+            .and_then(|o| doc.dereference(o))
+            .and_then(|(_, o)| o.as_array())
+        {
+            let nums: Vec<f32> = arr.iter().filter_map(|o| o.as_float().ok()).collect();
+            if let [a, b, c, e] = nums[..] {
+                return [a.min(c), b.min(e), a.max(c), b.max(e)];
+            }
+        }
+        node = d
+            .get(b"Parent")
+            .and_then(Object::as_reference)
+            .and_then(|id| doc.get_dictionary(id))
+            .ok();
+    }
+    [0.0, 0.0, 595.0, 842.0]
 }
 
 /// Appends `item` to the array under `key` in dictionary object `owner`,
