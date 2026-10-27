@@ -112,6 +112,9 @@ impl SignatureReport {
 /// Finds and checks every signature in `pdf`. `anchors` are trusted root
 /// certificates and `intermediates` extra CA certificates to build paths
 /// with (both DER); the bundled national CAs are added automatically.
+/// Timestamps are also accepted from authorities under the public roots
+/// that browsers trust (Mozilla's list), since commercial TSAs such as
+/// DigiCert chain there rather than to Uruguay's root.
 pub fn verify_pdf(
     pdf: &[u8],
     anchors: &[&[u8]],
@@ -127,6 +130,19 @@ pub fn verify_pdf(
         anchors: &anchors,
         intermediates: &intermediates,
     };
+    let tsa_anchors: Vec<&[u8]> = anchors
+        .iter()
+        .copied()
+        .chain(
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .map(|c| c.as_ref()),
+        )
+        .collect();
+    let tsa_trust = Trust {
+        anchors: &tsa_anchors,
+        intermediates: &intermediates,
+    };
 
     let mut sigs: Vec<(ObjectId, &Dictionary)> = doc
         .objects
@@ -139,7 +155,7 @@ pub fn verify_pdf(
 
     Ok(sigs
         .into_iter()
-        .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &trust))
+        .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &trust, &tsa_trust))
         .collect())
 }
 
@@ -172,6 +188,7 @@ fn check_one(
     sig: &Dictionary,
     field: Option<String>,
     trust: &Trust,
+    tsa_trust: &Trust,
 ) -> SignatureReport {
     let string = |key: &[u8]| {
         sig.get(key)
@@ -231,7 +248,7 @@ fn check_one(
         .iter()
         .map(|c| c.tbs_certificate.subject.to_string())
         .collect();
-    report.timestamp = signature_timestamp(&checked.signer_info, trust);
+    report.timestamp = signature_timestamp(&checked.signer_info, tsa_trust);
     let time = report
         .timestamp
         .as_ref()
