@@ -19,9 +19,28 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
+// Shows an error from Rust: a short message, with the technical details
+// (reader names, card answers) folded away for when someone asks for them.
+function showError(target, e, prefix = "") {
+  const message = e?.message ?? `${prefix}${e}`;
+  target.className = "bad";
+  target.replaceChildren(message);
+  if (e?.details) {
+    target.append(
+      el(
+        "details",
+        { className: "error-details" },
+        el("summary", { textContent: "Detalles" }),
+        el("pre", { textContent: e.details }),
+      ),
+    );
+  }
+}
+
 // --- Card -----------------------------------------------------------------
 
 async function refreshCard() {
+  $("refresh").disabled = true;
   $("card-status").textContent = "Buscando la cédula…";
   $("card-status").className = "muted";
   $("card-status").hidden = false;
@@ -42,9 +61,9 @@ async function refreshCard() {
     $("card-status").hidden = true;
     $("card-details").hidden = false;
   } catch (e) {
-    $("card-status").textContent = `No se encontró la cédula: ${e}`;
-    $("card-status").className = "bad";
+    showError($("card-status"), e);
   }
+  $("refresh").disabled = false;
   updateSignButton();
 }
 
@@ -82,6 +101,7 @@ async function sign(event) {
   const pin = $("pin").value;
   $("pin").value = "";
   $("sign-button").disabled = true;
+  $("refresh").disabled = true;
   result.className = "muted";
   result.textContent = $("use-tsa").checked ? "Firmando y pidiendo el sello de tiempo…" : "Firmando…";
   try {
@@ -99,8 +119,7 @@ async function sign(event) {
     result.className = "ok";
     result.textContent = `Listo: ${saved}`;
   } catch (e) {
-    result.className = "bad";
-    result.textContent = `No se pudo firmar: ${e}`;
+    showError(result, e, "No se pudo firmar: ");
   }
   // The tries counter may have changed either way.
   await refreshCard();
@@ -123,7 +142,9 @@ async function pickVerify() {
     }
     out.replaceChildren(...checks.map(renderCheck));
   } catch (e) {
-    out.replaceChildren(el("p", { className: "bad", textContent: `No se pudo verificar: ${e}` }));
+    const p = el("p");
+    showError(p, e, "No se pudo verificar: ");
+    out.replaceChildren(p);
   }
 }
 

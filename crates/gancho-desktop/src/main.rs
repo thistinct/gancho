@@ -5,8 +5,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use gancho_card::native::{self, NativeSigner, PinStatus};
+use gancho_card::native::{self, NativeError, NativeSigner, PinStatus};
 use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca::{self, CertificateSummary};
@@ -15,8 +16,83 @@ use gancho_core::tsp::{HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use serde::{Deserialize, Serialize};
 
-/// Errors cross to the window as their message.
-type Result<T> = std::result::Result<T, String>;
+type Result<T> = std::result::Result<T, UiError>;
+
+/// An error as the window shows it: a short message in plain Spanish that
+/// says what to do next, and the technical details behind a toggle.
+#[derive(Debug, Serialize)]
+struct UiError {
+    message: String,
+    details: Option<String>,
+}
+
+impl UiError {
+    fn with_details(message: &str, details: impl ToString) -> Self {
+        let details = details.to_string();
+        eprintln!("gancho: {message} ({details})");
+        Self {
+            message: message.into(),
+            details: Some(details),
+        }
+    }
+}
+
+impl From<String> for UiError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            details: None,
+        }
+    }
+}
+
+impl From<&str> for UiError {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+
+impl From<NativeError> for UiError {
+    fn from(e: NativeError) -> Self {
+        const RETRY: &str = "Sacala del lector, volvé a ponerla y tocá Actualizar.";
+        let message = match e.cause() {
+            NativeError::NoReader => {
+                "No se encontró el lector de tarjetas. Conectalo a la computadora y tocá Actualizar."
+                    .to_owned()
+            }
+            NativeError::NoService => "El servicio de tarjetas de la computadora no está \
+                funcionando. Reiniciá la computadora y probá de nuevo."
+                .to_owned(),
+            NativeError::NoCard => "No hay ninguna cédula en el lector. Poné la cédula en el \
+                lector y tocá Actualizar."
+                .to_owned(),
+            // Every reader holds some other card.
+            NativeError::NotACedula(_) => "No se encontró la cédula. Poné la cédula en el \
+                lector y tocá Actualizar."
+                .to_owned(),
+            NativeError::CardUnresponsive => format!("La cédula no responde. {RETRY}"),
+            NativeError::CardBusy => {
+                "Otro programa está usando la cédula. Cerralo y tocá Actualizar.".to_owned()
+            }
+            NativeError::PinFormat => "El PIN tiene que tener entre 4 y 8 números.".to_owned(),
+            NativeError::WrongPin(1) => "PIN incorrecto. Te queda 1 intento.".to_owned(),
+            NativeError::WrongPin(n) => format!("PIN incorrecto. Te quedan {n} intentos."),
+            NativeError::PinBlocked => "El PIN está bloqueado. Para desbloquearlo hay que ir a \
+                la Dirección Nacional de Identificación Civil."
+                .to_owned(),
+            NativeError::LastPinTry(_) => "Te queda un solo intento de PIN. Para no bloquear la \
+                cédula, Gancho no lo usa: desbloqueá o cambiá el PIN en la Dirección Nacional \
+                de Identificación Civil."
+                .to_owned(),
+            _ => format!("No se pudo leer la cédula. {RETRY}"),
+        };
+        Self::with_details(&message, e)
+    }
+}
+
+/// Only one card operation at a time: the connection is exclusive, so a
+/// lookup started while signing (or a second lookup) would only fail.
+static CARD: Mutex<()> = Mutex::new(());
 
 #[derive(Serialize)]
 struct Card {
@@ -69,11 +145,12 @@ fn non_empty(s: Option<String>) -> Option<String> {
 #[tauri::command]
 async fn card() -> Result<Card> {
     blocking(|| {
-        let readers = native::readers().map_err(|e| e.to_string())?;
-        let mut card = native::connect(None).map_err(|e| e.to_string())?;
-        let der = card.certificate().map_err(|e| e.to_string())?;
-        let summary = ca::summarize(&der).ok_or("no se pudo leer el certificado de la cédula")?;
-        let (pin_tries, pin_blocked) = match card.pin_status().map_err(|e| e.to_string())? {
+        let _guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+        let readers = native::readers()?;
+        let mut card = native::connect(None)?;
+        let der = card.certificate()?;
+        let summary = ca::summarize(&der).ok_or("No se pudo leer el certificado de la cédula.")?;
+        let (pin_tries, pin_blocked) = match card.pin_status()? {
             PinStatus::TriesLeft(n) => (Some(n), false),
             PinStatus::Blocked => (Some(0), true),
             PinStatus::Verified => (None, false),
@@ -125,9 +202,10 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
             return Err("elegí otro nombre: el original no se sobrescribe".into());
         }
         let input = std::fs::read(&request.input)
-            .map_err(|e| format!("reading {}: {e}", request.input.display()))?;
-        let card = native::connect(None).map_err(|e| e.to_string())?;
-        let mut signer = NativeSigner::new(card, &request.pin).map_err(|e| e.to_string())?;
+            .map_err(|e| UiError::with_details("No se pudo abrir el PDF.", e))?;
+        let _guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+        let card = native::connect(None)?;
+        let mut signer = NativeSigner::new(card, &request.pin)?;
         drop(request.pin);
 
         let options = SignOptions {
@@ -140,9 +218,10 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
         let mut tsa = non_empty(request.tsa).map(HttpTsa);
         let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
         let signed = sign_pdf_timestamped(&input, &mut signer, &options, tsa)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| UiError::with_details("No se pudo firmar el PDF.", e))?;
+        drop(signer);
         std::fs::write(&request.output, signed)
-            .map_err(|e| format!("writing {}: {e}", request.output.display()))?;
+            .map_err(|e| UiError::with_details("No se pudo guardar el PDF firmado.", e))?;
         Ok(request.output)
     })
     .await
@@ -158,8 +237,10 @@ fn same_file(a: &Path, b: &Path) -> bool {
 #[tauri::command]
 async fn verify(path: PathBuf) -> Result<Vec<Check>> {
     blocking(move || {
-        let pdf = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let reports = verify_pdf(&pdf, &[], &[]).map_err(|e| e.to_string())?;
+        let pdf = std::fs::read(&path)
+            .map_err(|e| UiError::with_details("No se pudo abrir el PDF.", e))?;
+        let reports = verify_pdf(&pdf, &[], &[])
+            .map_err(|e| UiError::with_details("No se pudo leer el PDF.", e))?;
         Ok(reports.iter().map(check_view).collect())
     })
     .await
@@ -169,7 +250,10 @@ fn check_view(r: &SignatureReport) -> Check {
     let mut notes = Vec::new();
     let mut note = |ok: bool, text: String| notes.push(Note { ok, text });
     match &r.integrity {
-        Ok(()) => note(true, "El documento no fue modificado desde que se firmó.".into()),
+        Ok(()) => note(
+            true,
+            "El documento no fue modificado desde que se firmó.".into(),
+        ),
         Err(e) => note(false, format!("Firma inválida: {e}.")),
     }
     if r.integrity.is_ok() {
@@ -180,9 +264,15 @@ fn check_view(r: &SignatureReport) -> Check {
             );
         }
         if r.trusted {
-            note(true, "El certificado encadena a la raíz nacional de Uruguay.".into());
+            note(
+                true,
+                "El certificado encadena a la raíz nacional de Uruguay.".into(),
+            );
         } else {
-            note(false, "El certificado no encadena a una raíz de confianza.".into());
+            note(
+                false,
+                "El certificado no encadena a una raíz de confianza.".into(),
+            );
         }
         match r.valid_at_signing_time {
             Some(true) => note(true, "El certificado estaba vigente al firmar.".into()),
@@ -197,7 +287,11 @@ fn check_view(r: &SignatureReport) -> Check {
                         "Sello de tiempo del {} emitido por {}{}",
                         ts.time.map_or_else(|| "?".into(), format_utc),
                         ts.tsa.as_deref().unwrap_or("una autoridad desconocida"),
-                        if trusted { "." } else { " (autoridad no confiable)." }
+                        if trusted {
+                            "."
+                        } else {
+                            " (autoridad no confiable)."
+                        }
                     ),
                 ),
                 (Err(e), _) => note(false, format!("Sello de tiempo inválido: {e}.")),
@@ -223,7 +317,7 @@ fn check_view(r: &SignatureReport) -> Check {
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tauri::async_runtime::spawn_blocking(f)
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| UiError::with_details("Algo salió mal. Probá de nuevo.", e))?
 }
 
 fn main() {
@@ -232,4 +326,50 @@ fn main() {
         .invoke_handler(tauri::generate_handler![card, default_output, sign, verify])
         .run(tauri::generate_context!())
         .expect("error while running the Gancho window");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gancho_card::native::ReaderFailure;
+
+    #[test]
+    fn unresponsive_cedula_next_to_a_yubikey() {
+        let e = UiError::from(NativeError::NotACedula(vec![
+            ReaderFailure {
+                reader: "Generic EMV Smartcard Reader".into(),
+                atr: vec![0x3B],
+                error: Box::new(NativeError::CardUnresponsive),
+            },
+            ReaderFailure {
+                reader: "Yubico YubiKey OTP+FIDO+CCID".into(),
+                atr: vec![0x3B],
+                error: Box::new(NativeError::Status {
+                    what: "SELECT application",
+                    sw: 0x6A82,
+                }),
+            },
+        ]));
+        assert_eq!(
+            e.message,
+            "La cédula no responde. Sacala del lector, volvé a ponerla y tocá Actualizar."
+        );
+        assert!(e.details.unwrap().contains("YubiKey"));
+    }
+
+    #[test]
+    fn only_other_cards() {
+        let e = UiError::from(NativeError::NotACedula(vec![ReaderFailure {
+            reader: "Yubico YubiKey OTP+FIDO+CCID".into(),
+            atr: vec![0x3B],
+            error: Box::new(NativeError::Status {
+                what: "SELECT application",
+                sw: 0x6A82,
+            }),
+        }]));
+        assert_eq!(
+            e.message,
+            "No se encontró la cédula. Poné la cédula en el lector y tocá Actualizar."
+        );
+    }
 }
