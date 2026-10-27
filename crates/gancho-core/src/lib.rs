@@ -3,6 +3,7 @@
 //! The PDF/PAdES and CMS code lives here and only talks to a [`Signer`], so it
 //! can be tested with a software key and driven by the cédula in production.
 
+mod ber;
 pub mod ca;
 pub mod cms;
 pub mod pdf;
