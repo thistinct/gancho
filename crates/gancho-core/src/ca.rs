@@ -4,6 +4,10 @@
 //! which is in turn certified by "AC Raíz Nacional de Uruguay" (ACRN, run by
 //! AGESIC/UCE). Embedding both in each signature lets a validator connect the
 //! signer to the national root without fetching anything.
+//!
+//! "Autoridad Certificadora TuID" (ANTEL) is bundled too, so signatures
+//! made with TuID, whose PDFs carry only the signer's certificate, can be
+//! traced to the same root.
 
 use der::{Decode, Encode};
 use rsa::RsaPublicKey;
@@ -14,12 +18,13 @@ use x509_cert::Certificate;
 use x509_cert::ext::pkix::BasicConstraints;
 
 /// CA certificates (DER) shipped with gancho: the Ministerio del Interior
-/// CA that issues cédula certificates, and the national root (ACRN). See
-/// `certs/README.md` for sources and fingerprints.
-pub const BUNDLED: &[&[u8]] = &[MINISTERIO_DEL_INTERIOR, RAIZ_NACIONAL];
+/// CA that issues cédula certificates, the TuID CA, and the national root
+/// (ACRN). See `certs/README.md` for sources and fingerprints.
+pub const BUNDLED: &[&[u8]] = &[MINISTERIO_DEL_INTERIOR, TUID, RAIZ_NACIONAL];
 
 pub const MINISTERIO_DEL_INTERIOR: &[u8] = include_bytes!("../certs/mica.der");
 pub const RAIZ_NACIONAL: &[u8] = include_bytes!("../certs/acrn.der");
+pub const TUID: &[u8] = include_bytes!("../certs/tuid.der");
 
 /// Bundled certificates that are roots (self-signed), for use as trust
 /// anchors.
@@ -90,7 +95,8 @@ pub fn issued_by(cert: &Certificate, issuer: &Certificate) -> bool {
     let Ok(key) = public_key(issuer) else {
         return false;
     };
-    verify_rsa(&cert.signature_algorithm.oid.to_string(), &key, &tbs, sig)
+    Hash::from_rsa_signature_oid(&cert.signature_algorithm.oid.to_string())
+        .is_some_and(|h| verify_rsa(h, &key, &tbs, sig))
 }
 
 pub(crate) fn public_key(cert: &Certificate) -> Result<RsaPublicKey, ()> {
@@ -102,28 +108,68 @@ pub(crate) fn public_key(cert: &Certificate) -> Result<RsaPublicKey, ()> {
     RsaPublicKey::from_public_key_der(&spki).map_err(|_| ())
 }
 
-/// Verifies an RSA PKCS#1 v1.5 signature named by its X.509/CMS algorithm
-/// OID. `rsaEncryption` (as CMS uses it) is taken to mean SHA-256.
-pub(crate) fn verify_rsa(alg_oid: &str, key: &RsaPublicKey, msg: &[u8], sig: &[u8]) -> bool {
+/// Hash functions that appear in the Uruguayan PKI and common TSAs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Hash {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl Hash {
+    /// From a digest algorithm OID (`id-sha256`, ...).
+    pub(crate) fn from_digest_oid(oid: &str) -> Option<Self> {
+        Some(match oid {
+            "1.3.14.3.2.26" => Hash::Sha1,
+            "2.16.840.1.101.3.4.2.1" => Hash::Sha256,
+            "2.16.840.1.101.3.4.2.2" => Hash::Sha384,
+            "2.16.840.1.101.3.4.2.3" => Hash::Sha512,
+            _ => return None,
+        })
+    }
+
+    /// From an RSA signature algorithm OID (`sha256WithRSAEncryption`, ...).
+    pub(crate) fn from_rsa_signature_oid(oid: &str) -> Option<Self> {
+        Some(match oid {
+            "1.2.840.113549.1.1.5" => Hash::Sha1,
+            "1.2.840.113549.1.1.11" => Hash::Sha256,
+            "1.2.840.113549.1.1.12" => Hash::Sha384,
+            "1.2.840.113549.1.1.13" => Hash::Sha512,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn digest(self, parts: &[&[u8]]) -> Vec<u8> {
+        fn run<D: sha2::Digest>(parts: &[&[u8]]) -> Vec<u8> {
+            let mut h = D::new();
+            for p in parts {
+                h.update(p);
+            }
+            h.finalize().to_vec()
+        }
+        match self {
+            Hash::Sha1 => run::<sha1::Sha1>(parts),
+            Hash::Sha256 => run::<sha2::Sha256>(parts),
+            Hash::Sha384 => run::<sha2::Sha384>(parts),
+            Hash::Sha512 => run::<sha2::Sha512>(parts),
+        }
+    }
+}
+
+/// Verifies an RSA PKCS#1 v1.5 signature over `msg` hashed with `hash`.
+pub(crate) fn verify_rsa(hash: Hash, key: &RsaPublicKey, msg: &[u8], sig: &[u8]) -> bool {
     let Ok(sig) = Signature::try_from(sig) else {
         return false;
     };
     let key = key.clone();
-    match alg_oid {
-        "1.2.840.113549.1.1.5" => VerifyingKey::<sha1::Sha1>::new(key)
-            .verify(msg, &sig)
-            .is_ok(),
-        "1.2.840.113549.1.1.11" | "1.2.840.113549.1.1.1" => VerifyingKey::<sha2::Sha256>::new(key)
-            .verify(msg, &sig)
-            .is_ok(),
-        "1.2.840.113549.1.1.12" => VerifyingKey::<sha2::Sha384>::new(key)
-            .verify(msg, &sig)
-            .is_ok(),
-        "1.2.840.113549.1.1.13" => VerifyingKey::<sha2::Sha512>::new(key)
-            .verify(msg, &sig)
-            .is_ok(),
-        _ => false,
+    match hash {
+        Hash::Sha1 => VerifyingKey::<sha1::Sha1>::new(key).verify(msg, &sig),
+        Hash::Sha256 => VerifyingKey::<sha2::Sha256>::new(key).verify(msg, &sig),
+        Hash::Sha384 => VerifyingKey::<sha2::Sha384>::new(key).verify(msg, &sig),
+        Hash::Sha512 => VerifyingKey::<sha2::Sha512>::new(key).verify(msg, &sig),
     }
+    .is_ok()
 }
 
 #[cfg(test)]
@@ -148,14 +194,19 @@ mod tests {
             fingerprint(MINISTERIO_DEL_INTERIOR),
             "A29CAD5C89AA49CFF81F17F45C42FD44685510246D9AB5D031448E2FDA2517BE"
         );
+        assert_eq!(
+            fingerprint(TUID),
+            "F7C2D302FC18F29CAD0D2B60E4FC9EB564781F8D3F49693CE38C3B2CAE2F091E"
+        );
     }
 
     #[test]
-    fn ministerio_chains_to_the_national_root() {
+    fn intermediates_chain_to_the_national_root() {
         assert_eq!(bundled_roots(), vec![RAIZ_NACIONAL]);
         assert_eq!(
             issuer_chain(MINISTERIO_DEL_INTERIOR, BUNDLED),
             vec![RAIZ_NACIONAL.to_vec()]
         );
+        assert_eq!(issuer_chain(TUID, BUNDLED), vec![RAIZ_NACIONAL.to_vec()]);
     }
 }

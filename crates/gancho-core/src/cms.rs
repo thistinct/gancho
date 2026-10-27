@@ -18,6 +18,7 @@ use x509_cert::Certificate;
 use x509_cert::attr::Attribute;
 use x509_cert::spki::AlgorithmIdentifierOwned;
 
+use crate::tsp::{TimestampAuthority, TspError, fetch_token};
 use crate::{SignError, Signer};
 
 const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.1");
@@ -28,6 +29,8 @@ const ID_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47");
 const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 const ID_RSA_ENCRYPTION: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.1");
+const ID_SIGNATURE_TIME_STAMP_TOKEN: ObjectIdentifier =
+    ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.14");
 
 #[derive(Debug, thiserror::Error)]
 pub enum CmsError {
@@ -37,15 +40,19 @@ pub enum CmsError {
     Encode(#[from] der::Error),
     #[error(transparent)]
     Sign(#[from] SignError),
+    #[error(transparent)]
+    Timestamp(#[from] TspError),
 }
 
 /// Builds a DER `ContentInfo` holding a detached `SignedData` over content
 /// whose SHA-256 digest is `content_digest`. `chain` holds extra certificates
-/// to embed (intermediate CAs), DER encoded.
+/// to embed (intermediate CAs), DER encoded. With a `tsa`, the signature
+/// value is timestamped (CAdES/PAdES B-T).
 pub fn signed_data_detached(
     signer: &mut dyn Signer,
     content_digest: &[u8; 32],
     chain: &[Vec<u8>],
+    tsa: Option<&mut dyn TimestampAuthority>,
 ) -> Result<Vec<u8>, CmsError> {
     let cert_der = signer.certificate_der().to_vec();
     let cert = Certificate::from_der(&cert_der).map_err(CmsError::Certificate)?;
@@ -68,6 +75,18 @@ pub fn signed_data_detached(
     // The signature covers the DER of the attributes as a SET OF (tag 0x31),
     // not the [0] IMPLICIT form they take inside SignerInfo (RFC 5652 5.4).
     let signature = signer.sign_sha256_rsa(&signed_attrs.to_der()?)?;
+    let unsigned_attrs = match tsa {
+        Some(tsa) => {
+            let token = fetch_token(tsa, &signature)?;
+            let mut attrs = SetOfVec::new();
+            attrs.insert(attribute(
+                ID_SIGNATURE_TIME_STAMP_TOKEN,
+                Any::from_der(&token)?,
+            ))?;
+            Some(attrs)
+        }
+        None => None,
+    };
 
     let signer_info = SignerInfo {
         version: CmsVersion::V1,
@@ -82,7 +101,7 @@ pub fn signed_data_detached(
             parameters: Some(Any::null()),
         },
         signature: OctetString::new(signature)?,
-        unsigned_attrs: None,
+        unsigned_attrs,
     };
 
     let mut certs = SetOfVec::new();

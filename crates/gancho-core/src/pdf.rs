@@ -15,11 +15,12 @@ use sha2::{Digest, Sha256};
 
 use crate::Signer;
 use crate::cms::{CmsError, signed_data_detached};
+use crate::tsp::TimestampAuthority;
 
 /// Bytes reserved for the DER signature. A cédula signature with its
-/// certificate and the CA chain is about 5 KiB; the rest leaves room for a
-/// timestamp token later on.
-const SIGNATURE_CAPACITY: usize = 16 * 1024;
+/// certificate and the CA chain is about 5 KiB, and public TSAs' tokens
+/// (with their own certificate chains) add up to 8 KiB more.
+const SIGNATURE_CAPACITY: usize = 24 * 1024;
 /// Placeholder that is wide enough for any real offset, and is overwritten
 /// in place once the final offsets are known.
 const BYTE_RANGE_PLACEHOLDER: i64 = 9_999_999_999;
@@ -57,11 +58,22 @@ pub struct SignOptions {
     pub chain: Vec<Vec<u8>>,
 }
 
-/// Signs `input` and returns the signed PDF.
+/// Signs `input` and returns the signed PDF (PAdES-B-B).
 pub fn sign_pdf(
     input: &[u8],
     signer: &mut dyn Signer,
     options: &SignOptions,
+) -> Result<Vec<u8>, PdfError> {
+    sign_pdf_timestamped(input, signer, options, None)
+}
+
+/// Like [`sign_pdf`], and with a `tsa` also timestamps the signature
+/// (PAdES-B-T).
+pub fn sign_pdf_timestamped(
+    input: &[u8],
+    signer: &mut dyn Signer,
+    options: &SignOptions,
+    tsa: Option<&mut dyn TimestampAuthority>,
 ) -> Result<Vec<u8>, PdfError> {
     let doc = Document::load_mem(input).map_err(PdfError::Parse)?;
     if doc.is_encrypted() {
@@ -79,7 +91,7 @@ pub fn sign_pdf(
     hasher.update(&out[contents_end..]);
     let digest: [u8; 32] = hasher.finalize().into();
 
-    let cms = signed_data_detached(signer, &digest, &options.chain)?;
+    let cms = signed_data_detached(signer, &digest, &options.chain, tsa)?;
     if cms.len() > SIGNATURE_CAPACITY {
         return Err(PdfError::TooLarge(cms.len()));
     }

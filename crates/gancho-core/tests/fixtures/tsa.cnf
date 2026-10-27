@@ -1,0 +1,16 @@
+# Minimal `openssl ts -reply` configuration for the timestamp tests.
+# Paths are relative to the directory the test runs openssl in.
+[tsa]
+default_tsa = tsa_config
+[tsa_config]
+serial = ./serial
+signer_cert = ./tsa-cert.pem
+signer_key = ./tsa-key.pem
+signer_digest = sha256
+default_policy = 1.2.3.4.1
+digests = sha256
+accuracy = secs:1
+ess_cert_id_alg = sha256
+ordering = no
+tsa_name = no
+ess_cert_id_chain = no

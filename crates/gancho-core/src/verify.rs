@@ -3,22 +3,25 @@
 //! For each signature this checks that the signed bytes are intact (the
 //! `/ByteRange` digest matches the CMS `message-digest`, and the CMS
 //! signature verifies with the signer's certificate), whether later
-//! revisions were appended after it, and whether the signer's certificate
-//! chains up to a trusted root. Revocation (CRL/OCSP) is not checked yet.
+//! revisions were appended after it, whether the signer's certificate
+//! chains up to a trusted root, and any RFC 3161 signature timestamp.
+//! Revocation (CRL/OCSP) is not checked yet.
 
 use cms::cert::CertificateChoices;
 use cms::content_info::ContentInfo;
-use cms::signed_data::{SignedData, SignerIdentifier};
+use cms::signed_data::{SignedData, SignerIdentifier, SignerInfo};
 use der::asn1::OctetString;
 use der::{Decode, Encode};
 use lopdf::{Dictionary, Document, Object, ObjectId};
-use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
+use x509_tsp::TstInfo;
 
-use crate::ca;
+use crate::ber;
+use crate::ca::{self, Hash};
 
-const ID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 const ID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+const ID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+const ID_SIGNATURE_TIME_STAMP_TOKEN: &str = "1.2.840.113549.1.9.16.2.14";
 
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
@@ -26,7 +29,7 @@ pub enum VerifyError {
     Parse(lopdf::Error),
 }
 
-/// Why a signature's bytes don't check out.
+/// Why a signature's (or timestamp's) bytes don't check out.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IntegrityError {
     #[error("/ByteRange is missing or malformed")]
@@ -35,14 +38,37 @@ pub enum IntegrityError {
     ByteRangeGap,
     #[error("the signature is not readable CMS: {0}")]
     Cms(String),
-    #[error("unsupported digest algorithm {0}")]
-    DigestAlgorithm(String),
+    #[error("unsupported algorithm {0}")]
+    Algorithm(String),
     #[error("the signer's certificate is not in the signature")]
     SignerCertificate,
-    #[error("the document was changed: the digest does not match")]
+    #[error("the signed data was changed: the digest does not match")]
     Digest,
     #[error("the cryptographic signature does not verify")]
     Signature,
+    #[error("the timestamp is for a different signature")]
+    TimestampImprint,
+}
+
+/// An RFC 3161 timestamp on a signature (PAdES-B-T).
+#[derive(Debug, Clone)]
+pub struct TimestampReport {
+    /// Time asserted by the timestamp authority, Unix seconds.
+    pub time: Option<i64>,
+    /// Timestamp authority certificate subject.
+    pub tsa: Option<String>,
+    /// The token is intact, signed by the TSA, and covers this signature.
+    pub integrity: Result<(), IntegrityError>,
+    /// The TSA certificate chains to a trust anchor.
+    pub trusted: bool,
+}
+
+impl TimestampReport {
+    fn trusted_time(&self) -> Option<i64> {
+        (self.integrity.is_ok() && self.trusted)
+            .then_some(self.time)
+            .flatten()
+    }
 }
 
 /// One signature found in the PDF.
@@ -67,21 +93,29 @@ pub struct SignatureReport {
     pub chain: Vec<String>,
     /// The path ends at one of the trust anchors.
     pub trusted: bool,
-    /// Every certificate on the path was valid at the claimed signing time
-    /// (`None` when the time is missing or unreadable).
+    /// Every certificate on the path was valid at the signing time: the
+    /// timestamp's when it is trusted, otherwise the claimed `/M` time
+    /// (`None` when neither is available).
     pub valid_at_signing_time: Option<bool>,
+    pub timestamp: Option<TimestampReport>,
 }
 
 impl SignatureReport {
-    /// Intact, trusted and in date.
+    /// Intact, trusted and in date, with an intact timestamp if it has one.
     pub fn is_valid(&self) -> bool {
-        self.integrity.is_ok() && self.trusted && self.valid_at_signing_time != Some(false)
+        self.integrity.is_ok()
+            && self.trusted
+            && self.valid_at_signing_time != Some(false)
+            && self.timestamp.as_ref().is_none_or(|t| t.integrity.is_ok())
     }
 }
 
 /// Finds and checks every signature in `pdf`. `anchors` are trusted root
 /// certificates and `intermediates` extra CA certificates to build paths
 /// with (both DER); the bundled national CAs are added automatically.
+/// Timestamps are also accepted from authorities under the public roots
+/// that browsers trust (Mozilla's list), since commercial TSAs such as
+/// DigiCert chain there rather than to Uruguay's root.
 pub fn verify_pdf(
     pdf: &[u8],
     anchors: &[&[u8]],
@@ -91,6 +125,25 @@ pub fn verify_pdf(
     let names = field_names(&doc);
     let mut anchors: Vec<&[u8]> = anchors.to_vec();
     anchors.extend(ca::bundled_roots());
+    let mut intermediates: Vec<&[u8]> = intermediates.to_vec();
+    intermediates.extend(ca::BUNDLED);
+    let trust = Trust {
+        anchors: &anchors,
+        intermediates: &intermediates,
+    };
+    let tsa_anchors: Vec<&[u8]> = anchors
+        .iter()
+        .copied()
+        .chain(
+            webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                .iter()
+                .map(|c| c.as_ref()),
+        )
+        .collect();
+    let tsa_trust = Trust {
+        anchors: &tsa_anchors,
+        intermediates: &intermediates,
+    };
 
     let mut sigs: Vec<(ObjectId, &Dictionary)> = doc
         .objects
@@ -103,16 +156,40 @@ pub fn verify_pdf(
 
     Ok(sigs
         .into_iter()
-        .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &anchors, intermediates))
+        .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &trust, &tsa_trust))
         .collect())
+}
+
+struct Trust<'a> {
+    anchors: &'a [&'a [u8]],
+    intermediates: &'a [&'a [u8]],
+}
+
+impl Trust<'_> {
+    /// The path from `cert` upwards (starting with `cert`) using `carried`
+    /// certificates as well, and whether it ends at an anchor.
+    fn path(&self, cert: &Certificate, carried: &[Vec<u8>]) -> (Vec<Certificate>, bool) {
+        let der = cert.to_der().unwrap_or_default();
+        let mut pool: Vec<&[u8]> = carried.iter().map(Vec::as_slice).collect();
+        pool.extend(self.anchors);
+        pool.extend(self.intermediates);
+        let chain = ca::issuer_chain(&der, &pool);
+        let trusted = self
+            .anchors
+            .contains(&chain.last().unwrap_or(&der).as_slice());
+        let certs = std::iter::once(cert.clone())
+            .chain(chain.iter().filter_map(|d| Certificate::from_der(d).ok()))
+            .collect();
+        (certs, trusted)
+    }
 }
 
 fn check_one(
     pdf: &[u8],
     sig: &Dictionary,
     field: Option<String>,
-    anchors: &[&[u8]],
-    intermediates: &[&[u8]],
+    trust: &Trust,
+    tsa_trust: &Trust,
 ) -> SignatureReport {
     let string = |key: &[u8]| {
         sig.get(key)
@@ -137,6 +214,7 @@ fn check_one(
         chain: Vec::new(),
         trusted: false,
         valid_at_signing_time: None,
+        timestamp: None,
     };
 
     let Some(range) = byte_range(sig) else {
@@ -150,71 +228,111 @@ fn check_one(
     }
     report.covers_whole_file = pdf[c + d..].iter().all(u8::is_ascii_whitespace);
 
-    let contents = match sig.get(b"Contents").and_then(Object::as_str) {
+    let Ok(contents) = sig.get(b"Contents").and_then(Object::as_str) else {
+        report.integrity = Err(IntegrityError::ByteRange);
+        return report;
+    };
+    let checked = parse_signed_data(contents)
+        .and_then(|sd| check_signed_data(&sd, &[&pdf[..b], &pdf[c..c + d]]));
+    let checked = match checked {
         Ok(c) => c,
-        Err(_) => {
-            report.integrity = Err(IntegrityError::ByteRange);
+        Err(e) => {
+            report.integrity = Err(e);
             return report;
         }
     };
-    let mut hasher = Sha256::new();
-    hasher.update(&pdf[..b]);
-    hasher.update(&pdf[c..c + d]);
-    let digest = hasher.finalize();
 
-    match check_cms(contents, &digest) {
-        Ok((signer, certs)) => {
-            report.signer = Some(signer.tbs_certificate.subject.to_string());
-            let signer_der = signer.to_der().unwrap_or_default();
-            let mut pool: Vec<&[u8]> = certs.iter().map(Vec::as_slice).collect();
-            pool.extend(anchors);
-            pool.extend(intermediates);
-            pool.extend(ca::BUNDLED);
-            let path = ca::issuer_chain(&signer_der, &pool);
-            let top = path.last().unwrap_or(&signer_der);
-            report.trusted = anchors.contains(&top.as_slice());
-            let path_certs: Vec<Certificate> = std::iter::once(signer)
-                .chain(
-                    path.iter()
-                        .filter_map(|der| Certificate::from_der(der).ok()),
-                )
-                .collect();
-            report.chain = path_certs[1..]
-                .iter()
-                .map(|c| c.tbs_certificate.subject.to_string())
-                .collect();
-            report.valid_at_signing_time = signed_at
-                .as_deref()
-                .and_then(parse_pdf_date)
-                .map(|t| path_certs.iter().all(|c| valid_at(c, t)));
-        }
-        Err(e) => report.integrity = Err(e),
-    }
+    report.signer = Some(checked.signer.tbs_certificate.subject.to_string());
+    let (path, trusted) = trust.path(&checked.signer, &checked.certs);
+    report.trusted = trusted;
+    report.chain = path[1..]
+        .iter()
+        .map(|c| c.tbs_certificate.subject.to_string())
+        .collect();
+    report.timestamp = signature_timestamp(&checked.signer_info, tsa_trust);
+    let time = report
+        .timestamp
+        .as_ref()
+        .and_then(TimestampReport::trusted_time)
+        .or_else(|| signed_at.as_deref().and_then(parse_pdf_date));
+    report.valid_at_signing_time = time.map(|t| path.iter().all(|c| valid_at(c, t)));
     report
 }
 
-/// Checks the CMS against the digest of the signed bytes. Returns the
-/// signer's certificate and all certificates carried in the signature.
-fn check_cms(
-    contents: &[u8],
-    digest: &[u8],
-) -> Result<(Certificate, Vec<Vec<u8>>), IntegrityError> {
+/// Checks the `signature-time-stamp` unsigned attribute, if present.
+fn signature_timestamp(si: &SignerInfo, trust: &Trust) -> Option<TimestampReport> {
+    let token = si
+        .unsigned_attrs
+        .as_ref()?
+        .iter()
+        .find(|a| a.oid.to_string() == ID_SIGNATURE_TIME_STAMP_TOKEN)?
+        .values
+        .iter()
+        .next()?
+        .to_der()
+        .ok()?;
+    let mut report = TimestampReport {
+        time: None,
+        tsa: None,
+        integrity: Ok(()),
+        trusted: false,
+    };
+    let result = (|| {
+        let sd = parse_signed_data(&token)?;
+        let tst_der = sd
+            .encap_content_info
+            .econtent
+            .as_ref()
+            .ok_or(IntegrityError::Cms("timestamp has no content".into()))?
+            .decode_as::<OctetString>()
+            .map_err(|e| IntegrityError::Cms(e.to_string()))?;
+        let checked = check_signed_data(&sd, &[tst_der.as_bytes()])?;
+        let tst = TstInfo::from_der(tst_der.as_bytes())
+            .map_err(|e| IntegrityError::Cms(e.to_string()))?;
+        report.time = Some(tst.gen_time.to_unix_duration().as_secs() as i64);
+        report.tsa = Some(checked.signer.tbs_certificate.subject.to_string());
+        let alg = tst.message_imprint.hash_algorithm.oid.to_string();
+        let hash = Hash::from_digest_oid(&alg).ok_or(IntegrityError::Algorithm(alg))?;
+        if hash.digest(&[si.signature.as_bytes()]) != tst.message_imprint.hashed_message.as_bytes()
+        {
+            return Err(IntegrityError::TimestampImprint);
+        }
+        report.trusted = trust.path(&checked.signer, &checked.certs).1;
+        Ok(())
+    })();
+    report.integrity = result;
+    Some(report)
+}
+
+fn parse_signed_data(der: &[u8]) -> Result<SignedData, IntegrityError> {
     let cms_err = |e: der::Error| IntegrityError::Cms(e.to_string());
-    let info =
-        ContentInfo::from_der(trim_der(contents).ok_or(IntegrityError::Cms("bad length".into()))?)
-            .map_err(cms_err)?;
-    let sd: SignedData = info.content.decode_as().map_err(cms_err)?;
+    let der = ber::to_der(der).ok_or(IntegrityError::Cms("malformed encoding".into()))?;
+    ContentInfo::from_der(&der)
+        .map_err(cms_err)?
+        .content
+        .decode_as()
+        .map_err(cms_err)
+}
+
+struct Checked {
+    signer: Certificate,
+    signer_info: SignerInfo,
+    /// All certificates carried in the `SignedData`, DER.
+    certs: Vec<Vec<u8>>,
+}
+
+/// Checks the first signer of `sd` against `content` (the signed bytes,
+/// possibly in several pieces).
+fn check_signed_data(sd: &SignedData, content: &[&[u8]]) -> Result<Checked, IntegrityError> {
+    let cms_err = |e: der::Error| IntegrityError::Cms(e.to_string());
     let si = sd
         .signer_infos
         .0
         .iter()
         .next()
         .ok_or(IntegrityError::Cms("no signer".into()))?;
-    if si.digest_alg.oid.to_string() != ID_SHA256 {
-        return Err(IntegrityError::DigestAlgorithm(
-            si.digest_alg.oid.to_string(),
-        ));
-    }
+    let digest_alg = si.digest_alg.oid.to_string();
+    let hash = Hash::from_digest_oid(&digest_alg).ok_or(IntegrityError::Algorithm(digest_alg))?;
 
     let certs: Vec<Certificate> = sd
         .certificates
@@ -247,18 +365,26 @@ fn check_cms(
         .and_then(|a| a.values.iter().next())
         .and_then(|v| v.decode_as::<OctetString>().ok())
         .ok_or(IntegrityError::Cms("no message-digest".into()))?;
-    if message_digest.as_bytes() != digest {
+    if message_digest.as_bytes() != hash.digest(content) {
         return Err(IntegrityError::Digest);
     }
 
+    let sig_alg = si.signature_algorithm.oid.to_string();
+    let sig_hash = if sig_alg == ID_RSA_ENCRYPTION {
+        hash
+    } else {
+        Hash::from_rsa_signature_oid(&sig_alg).ok_or(IntegrityError::Algorithm(sig_alg))?
+    };
     let key = ca::public_key(&signer).map_err(|_| IntegrityError::Signature)?;
     let signed = attrs.to_der().map_err(cms_err)?;
-    let alg = si.signature_algorithm.oid.to_string();
-    if !ca::verify_rsa(&alg, &key, &signed, si.signature.as_bytes()) {
+    if !ca::verify_rsa(sig_hash, &key, &signed, si.signature.as_bytes()) {
         return Err(IntegrityError::Signature);
     }
-    let ders = certs.iter().filter_map(|c| c.to_der().ok()).collect();
-    Ok((signer, ders))
+    Ok(Checked {
+        signer,
+        signer_info: si.clone(),
+        certs: certs.iter().filter_map(|c| c.to_der().ok()).collect(),
+    })
 }
 
 /// `[offset1, length1, offset2, length2]`.
@@ -298,23 +424,6 @@ fn decode_text(b: &[u8]) -> String {
     } else {
         b.iter().map(|&c| c as char).collect()
     }
-}
-
-/// The DER prefix of a zero-padded `/Contents` value.
-fn trim_der(b: &[u8]) -> Option<&[u8]> {
-    let (hdr, len) = match *b.get(1)? {
-        n if n < 0x80 => (2, n as usize),
-        n @ 0x81..=0x84 => {
-            let k = (n & 0x7F) as usize;
-            let len = b
-                .get(2..2 + k)?
-                .iter()
-                .fold(0usize, |acc, x| acc << 8 | *x as usize);
-            (2 + k, len)
-        }
-        _ => return None,
-    };
-    b.get(..hdr + len)
 }
 
 fn valid_at(cert: &Certificate, unix: i64) -> bool {

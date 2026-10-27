@@ -8,7 +8,8 @@ use gancho_card::native::{self, NativeSigner, PinStatus};
 use gancho_card::pkcs11::Module;
 use gancho_core::Signer;
 use gancho_core::ca;
-use gancho_core::pdf::{SignOptions, sign_pdf};
+use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
+use gancho_core::tsp::TimestampAuthority;
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
@@ -86,6 +87,27 @@ struct SignArgs {
     /// signer's certificate. Can be repeated.
     #[arg(long = "ca", value_name = "FILE")]
     cas: Vec<PathBuf>,
+    /// RFC 3161 timestamp server to certify the signing time (PAdES-B-T),
+    /// e.g. http://timestamp.digicert.com
+    #[arg(long, value_name = "URL")]
+    tsa: Option<String>,
+}
+
+/// Talks to a timestamp server over HTTP(S).
+struct HttpTsa<'a>(&'a str);
+
+impl TimestampAuthority for HttpTsa<'_> {
+    fn post(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        let mut resp = ureq::post(self.0)
+            .header("Content-Type", "application/timestamp-query")
+            .send(request)
+            .map_err(|e| format!("{}: {e}", self.0))?;
+        resp.body_mut()
+            .with_config()
+            .limit(1024 * 1024)
+            .read_to_vec()
+            .map_err(|e| format!("{}: {e}", self.0))
+    }
 }
 
 fn main() -> Result<()> {
@@ -221,7 +243,9 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         chain,
         ..Default::default()
     };
-    let signed = sign_pdf(input, signer, &options)
+    let mut tsa = args.tsa.as_deref().map(HttpTsa);
+    let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
+    let signed = sign_pdf_timestamped(input, signer, &options, tsa)
         .with_context(|| format!("signing {}", args.input.display()))?;
     std::fs::write(&output, signed).with_context(|| format!("writing {}", output.display()))?;
     println!("signed: {}", output.display());
@@ -302,6 +326,21 @@ fn print_report(n: usize, r: &SignatureReport) {
                 "FAIL, no path to a trusted root"
             }
         );
+        if let Some(ts) = &r.timestamp {
+            match &ts.integrity {
+                Ok(()) => println!(
+                    "  timestamp: {} by {}, {}",
+                    ts.time.map_or_else(|| "?".into(), format_utc),
+                    ts.tsa.as_deref().unwrap_or("?"),
+                    if ts.trusted {
+                        "trusted"
+                    } else {
+                        "authority not trusted"
+                    }
+                ),
+                Err(e) => println!("  timestamp: FAIL, {e}"),
+            }
+        }
         match r.valid_at_signing_time {
             Some(ok) => println!("  dates:     {}", mark(ok)),
             None => println!("  dates:     unknown (no signing time)"),
