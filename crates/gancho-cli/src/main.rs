@@ -10,7 +10,7 @@ use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca;
 use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
-use gancho_core::tsp::TimestampAuthority;
+use gancho_core::tsp::{HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
@@ -114,23 +114,6 @@ fn parse_rect(s: &str) -> std::result::Result<[f32; 4], String> {
         [x1, y1, x2, y2] if x2 > x1 && y2 > y1 => Ok([x1, y1, x2, y2]),
         [_, _, _, _] => Err("x2 must exceed x1 and y2 must exceed y1".into()),
         _ => Err("expected four numbers: x1,y1,x2,y2".into()),
-    }
-}
-
-/// Talks to a timestamp server over HTTP(S).
-struct HttpTsa<'a>(&'a str);
-
-impl TimestampAuthority for HttpTsa<'_> {
-    fn post(&mut self, request: &[u8]) -> std::result::Result<Vec<u8>, String> {
-        let mut resp = ureq::post(self.0)
-            .header("Content-Type", "application/timestamp-query")
-            .send(request)
-            .map_err(|e| format!("{}: {e}", self.0))?;
-        resp.body_mut()
-            .with_config()
-            .limit(1024 * 1024)
-            .read_to_vec()
-            .map_err(|e| format!("{}: {e}", self.0))
     }
 }
 
@@ -273,7 +256,7 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         ),
         ..Default::default()
     };
-    let mut tsa = args.tsa.as_deref().map(HttpTsa);
+    let mut tsa = args.tsa.clone().map(HttpTsa);
     let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
     let signed = sign_pdf_timestamped(input, signer, &options, tsa)
         .with_context(|| format!("signing {}", args.input.display()))?;

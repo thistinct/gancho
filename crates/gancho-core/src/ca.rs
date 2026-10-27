@@ -22,6 +22,31 @@ pub fn bundled_roots() -> Vec<&'static [u8]> {
     BUNDLED.iter().copied().filter(|der| is_root(der)).collect()
 }
 
+/// What a person wants to know about a certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertificateSummary {
+    /// Full subject, RFC 4514 style.
+    pub subject: String,
+    /// Subject common name, usually the person's name.
+    pub common_name: Option<String>,
+    pub issuer: String,
+    /// Validity, Unix seconds.
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+pub fn summarize(der: &[u8]) -> Option<CertificateSummary> {
+    let c = Certificate::from_der(der).ok()?;
+    let tbs = &c.tbs_certificate;
+    Some(CertificateSummary {
+        subject: tbs.subject.to_string(),
+        common_name: crate::appearance::common_name(&c),
+        issuer: tbs.issuer.to_string(),
+        not_before: tbs.validity.not_before.to_unix_duration().as_secs() as i64,
+        not_after: tbs.validity.not_after.to_unix_duration().as_secs() as i64,
+    })
+}
+
 /// Walks from `cert_der` up through `pool`, returning the issuing
 /// certificates in order (issuer first, root last). Each link must be
 /// signed by the next. Stops at a self-signed certificate or when no

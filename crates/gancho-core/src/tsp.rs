@@ -6,8 +6,9 @@
 //! proves the signature existed at that time, so it stays verifiable
 //! after the signer's certificate expires.
 //!
-//! The HTTP exchange is left to the caller through [`TimestampAuthority`],
-//! keeping this crate free of networking.
+//! The HTTP exchange goes through [`TimestampAuthority`]; the `http`
+//! feature provides `HttpTsa`, so the core stays free of networking
+//! unless asked.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +44,27 @@ pub enum TspError {
 impl From<der::Error> for TspError {
     fn from(e: der::Error) -> Self {
         TspError::Malformed(e.to_string())
+    }
+}
+
+/// A timestamp server reached over HTTP(S), e.g.
+/// `http://timestamp.digicert.com`.
+#[cfg(feature = "http")]
+pub struct HttpTsa(pub String);
+
+#[cfg(feature = "http")]
+impl TimestampAuthority for HttpTsa {
+    fn post(&mut self, request: &[u8]) -> Result<Vec<u8>, String> {
+        let url = &self.0;
+        let mut resp = ureq::post(url)
+            .header("Content-Type", "application/timestamp-query")
+            .send(request)
+            .map_err(|e| format!("{url}: {e}"))?;
+        resp.body_mut()
+            .with_config()
+            .limit(1024 * 1024)
+            .read_to_vec()
+            .map_err(|e| format!("{url}: {e}"))
     }
 }
 

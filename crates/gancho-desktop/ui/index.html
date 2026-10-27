@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gancho</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header>
+    <h1>Gancho</h1>
+    <p>Firmá PDFs con tu cédula de identidad.</p>
+  </header>
+
+  <section class="card" id="card">
+    <div class="card-head">
+      <h2>Cédula</h2>
+      <button type="button" class="link" id="refresh">Actualizar</button>
+    </div>
+    <p id="card-status" class="muted">Buscando la cédula…</p>
+    <dl id="card-details" hidden>
+      <dt>Titular</dt><dd id="card-name"></dd>
+      <dt>Vigencia</dt><dd id="card-validity"></dd>
+      <dt>PIN</dt><dd id="card-pin"></dd>
+    </dl>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button type="button" role="tab" id="tab-sign" aria-selected="true">Firmar</button>
+    <button type="button" role="tab" id="tab-verify" aria-selected="false">Verificar</button>
+  </nav>
+
+  <form id="sign" class="panel" autocomplete="off">
+    <div class="row">
+      <button type="button" id="pick-input">Elegir PDF…</button>
+      <span id="input-name" class="muted">Ningún archivo elegido</span>
+    </div>
+    <div class="row" id="output-row" hidden>
+      <span class="muted">Se guarda como</span>
+      <span id="output-name"></span>
+      <button type="button" class="link" id="pick-output">Cambiar…</button>
+    </div>
+
+    <label>Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
+    <label>Lugar <input id="location" placeholder="Montevideo (opcional)"></label>
+    <label class="check"><input type="checkbox" id="visible" checked> Mostrar la firma en la última página</label>
+    <label class="check"><input type="checkbox" id="use-tsa"> Agregar sello de tiempo</label>
+    <label id="tsa-row" hidden>Servidor de sello de tiempo <input id="tsa" value="http://timestamp.digicert.com"></label>
+
+    <label>PIN <input id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required></label>
+    <button type="submit" class="primary" id="sign-button" disabled>Firmar</button>
+    <p id="sign-result" role="status"></p>
+  </form>
+
+  <section id="verify" class="panel" hidden>
+    <div class="row">
+      <button type="button" id="pick-verify">Elegir PDF firmado…</button>
+      <span id="verify-name" class="muted">No necesita la cédula</span>
+    </div>
+    <div id="verify-result" role="status"></div>
+  </section>
+</body>
+</html>
