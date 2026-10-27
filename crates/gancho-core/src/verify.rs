@@ -16,6 +16,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use x509_cert::Certificate;
 use x509_tsp::TstInfo;
 
+use crate::ber;
 use crate::ca::{self, Hash};
 
 const ID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
@@ -305,8 +306,8 @@ fn signature_timestamp(si: &SignerInfo, trust: &Trust) -> Option<TimestampReport
 
 fn parse_signed_data(der: &[u8]) -> Result<SignedData, IntegrityError> {
     let cms_err = |e: der::Error| IntegrityError::Cms(e.to_string());
-    let der = trim_der(der).ok_or(IntegrityError::Cms("bad length".into()))?;
-    ContentInfo::from_der(der)
+    let der = ber::to_der(der).ok_or(IntegrityError::Cms("malformed encoding".into()))?;
+    ContentInfo::from_der(&der)
         .map_err(cms_err)?
         .content
         .decode_as()
@@ -423,23 +424,6 @@ fn decode_text(b: &[u8]) -> String {
     } else {
         b.iter().map(|&c| c as char).collect()
     }
-}
-
-/// The DER prefix of a zero-padded `/Contents` value.
-fn trim_der(b: &[u8]) -> Option<&[u8]> {
-    let (hdr, len) = match *b.get(1)? {
-        n if n < 0x80 => (2, n as usize),
-        n @ 0x81..=0x84 => {
-            let k = (n & 0x7F) as usize;
-            let len = b
-                .get(2..2 + k)?
-                .iter()
-                .fold(0usize, |acc, x| acc << 8 | *x as usize);
-            (2 + k, len)
-        }
-        _ => return None,
-    };
-    b.get(..hdr + len)
 }
 
 fn valid_at(cert: &Certificate, unix: i64) -> bool {
