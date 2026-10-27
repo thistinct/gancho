@@ -84,3 +84,11 @@ button.link { border: none; background: none; color: var(--accent); padding: 0; 
 .sig { border-top: 1px solid var(--border); padding-top: 10px; }
 .sig h3 { margin: 0 0 4px; font-size: 15px; }
 .sig ul { margin: 6px 0 0; padding-left: 18px; }
+.error-details { margin-top: 6px; color: var(--muted); font-size: 13px; }
+.error-details summary { cursor: pointer; }
+.error-details pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12px/1.4 ui-monospace, Menlo, monospace;
+}

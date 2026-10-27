@@ -47,8 +47,8 @@ pub enum NativeError {
     CardBusy,
     #[error("no reader named like \"{0}\"")]
     ReaderNotFound(String),
-    #[error("no reader holds a cédula this tool can use: {0}")]
-    NotACedula(String),
+    #[error("no reader holds a cédula this tool can use: {}", list_failures(.0))]
+    NotACedula(Vec<ReaderFailure>),
     #[error("no card in the reader")]
     NoCard,
     #[error("the PIN must be {PIN_MIN_LEN} to {PIN_MAX_LEN} digits")]
@@ -70,6 +70,64 @@ pub enum NativeError {
     Malformed(&'static str),
     #[error(transparent)]
     Pcsc(#[from] pcsc::Error),
+}
+
+/// Why one reader was passed over while looking for the cédula.
+#[derive(Debug)]
+pub struct ReaderFailure {
+    pub reader: String,
+    pub atr: Vec<u8>,
+    pub error: Box<NativeError>,
+}
+
+impl ReaderFailure {
+    /// The reader holds some other card (a YubiKey, a bank card): it has no
+    /// IAS application.
+    pub fn is_other_card(&self) -> bool {
+        matches!(
+            *self.error,
+            NativeError::Status {
+                what: "SELECT application",
+                ..
+            }
+        )
+    }
+}
+
+impl std::fmt::Display for ReaderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} (ATR {})",
+            self.reader,
+            self.error,
+            hex(&self.atr)
+        )
+    }
+}
+
+fn list_failures(failures: &[ReaderFailure]) -> String {
+    failures
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+impl NativeError {
+    /// The error that explains the failure best. When several readers were
+    /// tried, that is the first one that failed for a reason other than
+    /// holding some other card (readers whose ATR looks like a cédula are
+    /// tried first); otherwise the error itself.
+    pub fn cause(&self) -> &NativeError {
+        match self {
+            NativeError::NotACedula(failures) => failures
+                .iter()
+                .find(|f| !f.is_other_card())
+                .map_or(self, |f| f.error.cause()),
+            e => e,
+        }
+    }
 }
 
 /// Sends one APDU and returns the response data followed by SW1 SW2.
@@ -465,25 +523,20 @@ pub fn connect(reader: Option<&str>) -> Result<Card<PcscTransport>, NativeError>
     for r in candidates {
         match connect_reader(&ctx, &r.name) {
             Ok(card) => return Ok(card),
-            Err(
-                e @ NativeError::Status {
-                    what: "SELECT application",
-                    ..
-                },
-            ) => tried.push(format!(
-                "{}: {e} (ATR {})",
-                r.name.to_string_lossy(),
-                hex(&r.atr)
-            )),
-            Err(e) if single => return Err(e),
-            Err(e) => tried.push(format!(
-                "{}: {e} (ATR {})",
-                r.name.to_string_lossy(),
-                hex(&r.atr)
-            )),
+            Err(e) => {
+                let failure = ReaderFailure {
+                    reader: r.name.to_string_lossy().into_owned(),
+                    atr: r.atr,
+                    error: Box::new(e),
+                };
+                if single && !failure.is_other_card() {
+                    return Err(*failure.error);
+                }
+                tried.push(failure);
+            }
         }
     }
-    Err(NativeError::NotACedula(tried.join("; ")))
+    Err(NativeError::NotACedula(tried))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -552,5 +605,53 @@ impl<T: Transport> Signer for NativeSigner<T> {
             NativeError::PinBlocked => SignError::PinBlocked,
             e => SignError::Device(e.to_string()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(reader: &str, error: NativeError) -> ReaderFailure {
+        ReaderFailure {
+            reader: reader.into(),
+            atr: vec![0x3B, 0x00],
+            error: Box::new(error),
+        }
+    }
+
+    #[test]
+    fn cause_skips_readers_with_other_cards() {
+        let e = NativeError::NotACedula(vec![
+            failure(
+                "YubiKey",
+                NativeError::Status {
+                    what: "SELECT application",
+                    sw: 0x6A82,
+                },
+            ),
+            failure("EMV reader", NativeError::CardUnresponsive),
+        ]);
+        assert!(matches!(e.cause(), NativeError::CardUnresponsive));
+        assert_eq!(
+            e.to_string(),
+            "no reader holds a cédula this tool can use: \
+             YubiKey: card answered 6A82 to SELECT application (ATR 3B00); \
+             EMV reader: the cédula is not responding; take it out of the reader, \
+             put it back in and try again (ATR 3B00)"
+        );
+    }
+
+    #[test]
+    fn cause_is_the_error_itself_when_only_other_cards() {
+        let e = NativeError::NotACedula(vec![failure(
+            "YubiKey",
+            NativeError::Status {
+                what: "SELECT application",
+                sw: 0x6A82,
+            },
+        )]);
+        assert!(matches!(e.cause(), NativeError::NotACedula(_)));
+        assert!(matches!(NativeError::NoCard.cause(), NativeError::NoCard));
     }
 }
