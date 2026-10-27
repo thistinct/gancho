@@ -1298,13 +1298,9 @@ dependencies = [
  "rsa",
  "sha1",
  "sha2 0.10.9",
-<<<<<<< HEAD
  "thiserror 2.0.21",
  "ureq",
-=======
- "thiserror",
  "webpki-root-certs",
->>>>>>> visible-signature
  "x509-cert 0.2.5",
  "x509-tsp",
 ]
@@ -4726,7 +4722,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-<<<<<<< HEAD
 name = "wasip2"
 version = "1.0.4+wasi-0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4878,14 +4873,15 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
-=======
+]
+
+[[package]]
 name = "webpki-root-certs"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e49d0e65abc00c142e8f9428da991da9f1a250c39be97459901eb12b9b49f62a"
 dependencies = [
  "rustls-pki-types",
->>>>>>> visible-signature
 ]
 
 [[package]]
