@@ -1,0 +1,302 @@
+# Builds the desktop app installers and the `gancho` command-line binaries
+# for macOS, Windows and Linux.
+#
+# - Pushing a tag `vX.Y.Z` builds everything and attaches it to a *draft*
+#   GitHub Release named after the tag; publish it by hand once checked.
+# - A pull request that touches this file, or running the workflow by hand
+#   (Actions tab), builds everything and keeps the files as run artifacts.
+#
+# Signing is optional. Without the secrets below the builds still succeed:
+# macOS gets an ad-hoc signature (users must right-click > Open the first
+# time) and Windows is unsigned (SmartScreen warns).
+#
+#   APPLE_CERTIFICATE            base64 of a "Developer ID Application" .p12
+#   APPLE_CERTIFICATE_PASSWORD   password of that .p12
+#   APPLE_SIGNING_IDENTITY       optional; found in the .p12 when left out
+#   APPLE_ID, APPLE_PASSWORD,    Apple ID, app-specific password and team id;
+#   APPLE_TEAM_ID                with these the app and CLI are notarized
+#   WINDOWS_CERTIFICATE          base64 of a code-signing .pfx
+#   WINDOWS_CERTIFICATE_PASSWORD password of that .pfx
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_CLI_VERSION: 2.12.2
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      label: ${{ steps.version.outputs.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Check versions
+        run: |
+          app=$(jq -r .version crates/gancho-desktop/tauri.conf.json)
+          cli=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "gancho") | .version')
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            want=${GITHUB_REF_NAME#v}
+            for v in "$app" "$cli"; do
+              if [ "$v" != "$want" ]; then
+                echo "::error::Tag $GITHUB_REF_NAME does not match version $v in tauri.conf.json / gancho-cli/Cargo.toml"
+                exit 1
+              fi
+            done
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "label=$want" >> "$GITHUB_OUTPUT"
+          else
+            echo "label=$app-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create draft release
+        if: steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --draft --verify-tag \
+              --title "Gancho ${TAG#v}" --generate-notes
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-latest
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+            tauri-args: --target universal-apple-darwin
+          - name: windows
+            os: windows-latest
+            tauri-args: --bundles msi,nsis
+          - name: linux
+            # The oldest supported Ubuntu, so the AppImage and the CLI run
+            # on as many distributions (glibc versions) as possible.
+            os: ubuntu-22.04
+            tauri-args: --bundles deb,rpm,appimage
+    runs-on: ${{ matrix.os }}
+    env:
+      LABEL: ${{ needs.prepare.outputs.label }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libpcsclite-dev patchelf
+
+      - name: Install the Tauri CLI
+        run: npm install -g "@tauri-apps/cli@$TAURI_CLI_VERSION"
+
+      - name: Set up macOS signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "::warning::APPLE_CERTIFICATE not set: the macOS app gets an ad-hoc signature and is not notarized."
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # Import the certificate into a throwaway keychain, so both Tauri
+          # and the CLI step below can sign with it.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kpass=$(openssl rand -hex 16)
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kpass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kpass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$kpass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            APPLE_SIGNING_IDENTITY=$(security find-identity -v -p codesigning "$keychain" \
+              | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')
+          fi
+          if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity in APPLE_CERTIFICATE."
+            exit 1
+          fi
+          echo "Signing as: $APPLE_SIGNING_IDENTITY"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+          else
+            echo "::warning::APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not all set: signed but not notarized."
+          fi
+
+      - name: Set up Windows signing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:WINDOWS_CERTIFICATE) {
+            Write-Output "::warning::WINDOWS_CERTIFICATE not set: the Windows installers are unsigned."
+            exit 0
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          $config = @{ bundle = @{ windows = @{
+            certificateThumbprint = $cert.Thumbprint
+            digestAlgorithm = 'sha256'
+            timestampUrl = 'http://timestamp.digicert.com'
+          } } } | ConvertTo-Json -Depth 5
+          $configPath = Join-Path $env:RUNNER_TEMP 'tauri.signing.json'
+          Set-Content -Path $configPath -Value $config
+          "TAURI_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
+          "WINDOWS_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+
+      - name: Build the desktop app
+        working-directory: crates/gancho-desktop
+        run: tauri build ${{ matrix.tauri-args }} ${TAURI_SIGNING_CONFIG:+--config "$TAURI_SIGNING_CONFIG"}
+
+      - name: Build the CLI
+        run: |
+          mkdir -p dist cli
+          cp README.md cli/
+          case "$RUNNER_OS" in
+            macOS)
+              cargo build --release -p gancho --target aarch64-apple-darwin
+              cargo build --release -p gancho --target x86_64-apple-darwin
+              lipo -create -output cli/gancho \
+                target/aarch64-apple-darwin/release/gancho \
+                target/x86_64-apple-darwin/release/gancho
+              if [ "$APPLE_SIGNING_IDENTITY" = "-" ]; then
+                codesign --force --sign - cli/gancho
+              else
+                codesign --force --options runtime --timestamp \
+                  --sign "$APPLE_SIGNING_IDENTITY" cli/gancho
+              fi
+              (cd cli && zip -q "../dist/gancho-cli-$LABEL-macos-universal.zip" gancho README.md)
+              if [ -n "$APPLE_ID" ]; then
+                xcrun notarytool submit "dist/gancho-cli-$LABEL-macos-universal.zip" \
+                  --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" --wait
+              fi
+              ;;
+            Windows)
+              cargo build --release -p gancho
+              cp target/release/gancho.exe cli/
+              if [ -n "$WINDOWS_THUMBPRINT" ]; then
+                signtool=$(ls "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/signtool.exe | sort | tail -1)
+                MSYS_NO_PATHCONV=1 "$signtool" sign /sha1 "$WINDOWS_THUMBPRINT" /fd sha256 \
+                  /tr http://timestamp.digicert.com /td sha256 cli/gancho.exe
+              fi
+              (cd cli && 7z a -bd "../dist/gancho-cli-$LABEL-windows-x86_64.zip" gancho.exe README.md >/dev/null)
+              ;;
+            Linux)
+              cargo build --release -p gancho
+              cp target/release/gancho cli/
+              tar -C cli -czf "dist/gancho-cli-$LABEL-linux-x86_64.tar.gz" gancho README.md
+              ;;
+          esac
+
+      - name: Collect the installers
+        run: |
+          case "$RUNNER_OS" in
+            macOS)
+              dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+              if [ -n "$APPLE_ID" ]; then
+                # Tauri notarizes the .app inside; notarize the disk image too
+                # so Gatekeeper accepts it offline.
+                xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" \
+                  --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+                xcrun stapler staple "$dmg"
+              fi
+              cp "$dmg" "dist/Gancho-$LABEL-macos-universal.dmg"
+              ;;
+            Windows)
+              cp target/release/bundle/msi/*.msi "dist/Gancho-$LABEL-windows-x64.msi"
+              cp target/release/bundle/nsis/*-setup.exe "dist/Gancho-$LABEL-windows-x64-setup.exe"
+              ;;
+            Linux)
+              cp target/release/bundle/deb/*.deb "dist/gancho_${LABEL}_amd64.deb"
+              cp target/release/bundle/rpm/*.rpm "dist/gancho-$LABEL.x86_64.rpm"
+              cp target/release/bundle/appimage/*.AppImage "dist/Gancho-$LABEL-linux-x86_64.AppImage"
+              ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gancho-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: env.TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" dist/* --clobber
+
+      - name: Remove the signing keychain
+        if: always() && env.SIGNING_KEYCHAIN != ''
+        run: security delete-keychain "$SIGNING_KEYCHAIN"
+
+  checksums:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          gh release upload "$TAG" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"

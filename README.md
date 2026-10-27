@@ -22,6 +22,12 @@ The command sequence follows AGESIC's technical documentation as written up in [
 | `gancho-cli` | The `gancho` binary. |
 | `gancho-desktop` | Tauri 2 window (plain HTML in `ui/`, logic in Rust): card status, sign with PIN, verify. |
 
+## Download
+
+Installers for the desktop app (macOS `.dmg`, Windows `.msi`/`-setup.exe`, Linux `.deb`/`.rpm`/`.AppImage`) and the `gancho` command-line binaries are attached to each [GitHub Release](https://github.com/thistinct/gancho/releases). On Linux, also install `pcscd` (the `.deb` and `.rpm` pull it in).
+
+To cut a release, set the same version in `crates/gancho-desktop/tauri.conf.json` and `crates/gancho-cli/Cargo.toml`, then push a tag `vX.Y.Z`. The `Release` workflow builds everything and attaches it to a draft release to publish by hand. Signing and notarization are optional; the secrets are listed at the top of `.github/workflows/release.yml`.
+
 ## Try it
 
 Install Rust (<https://rustup.rs>), plug in the reader, insert the cédula, then:
@@ -63,4 +69,4 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 4. **Timestamps** (done): `sign --tsa URL` (PAdES-B-T). **Long-term validation** next: a DSS dictionary with the chain and CRLs (PAdES-B-LT).
 5. **Visible signature** (done): `sign --visible`.
 6. **Desktop app** (done, Tauri 2): pick file, show certificate, enter PIN, sign, verify.
-7. Packaging per OS, plus CAdES `.p7s` for arbitrary files.
+7. **Packaging** (done): release builds per OS from CI. Next: CAdES `.p7s` for arbitrary files.

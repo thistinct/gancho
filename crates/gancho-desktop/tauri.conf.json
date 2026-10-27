@@ -32,6 +32,16 @@
       "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "category": "Productivity",
+    "shortDescription": "Firmar PDFs con la cédula uruguaya",
+    "linux": {
+      "deb": {
+        "depends": ["pcscd"]
+      },
+      "rpm": {
+        "depends": ["pcsc-lite"]
+      }
+    }
   }
 }
