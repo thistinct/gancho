@@ -13,8 +13,13 @@ use rsa::signature::Verifier;
 use x509_cert::Certificate;
 use x509_cert::ext::pkix::BasicConstraints;
 
-/// CA certificates (DER) shipped with gancho: intermediates and roots.
-pub const BUNDLED: &[&[u8]] = &[];
+/// CA certificates (DER) shipped with gancho: the Ministerio del Interior
+/// CA that issues cédula certificates, and the national root (ACRN). See
+/// `certs/README.md` for sources and fingerprints.
+pub const BUNDLED: &[&[u8]] = &[MINISTERIO_DEL_INTERIOR, RAIZ_NACIONAL];
+
+pub const MINISTERIO_DEL_INTERIOR: &[u8] = include_bytes!("../certs/mica.der");
+pub const RAIZ_NACIONAL: &[u8] = include_bytes!("../certs/acrn.der");
 
 /// Bundled certificates that are roots (self-signed), for use as trust
 /// anchors.
@@ -118,5 +123,39 @@ pub(crate) fn verify_rsa(alg_oid: &str, key: &RsaPublicKey, msg: &[u8], sig: &[u
             .verify(msg, &sig)
             .is_ok(),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn fingerprint(der: &[u8]) -> String {
+        Sha256::digest(der)
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect()
+    }
+
+    #[test]
+    fn bundled_certificates_are_the_published_ones() {
+        assert_eq!(
+            fingerprint(RAIZ_NACIONAL),
+            "5533A0401F612C688EBCE5BF53F2EC14A734EB178BFAE00E50E85DAE6723078A"
+        );
+        assert_eq!(
+            fingerprint(MINISTERIO_DEL_INTERIOR),
+            "A29CAD5C89AA49CFF81F17F45C42FD44685510246D9AB5D031448E2FDA2517BE"
+        );
+    }
+
+    #[test]
+    fn ministerio_chains_to_the_national_root() {
+        assert_eq!(bundled_roots(), vec![RAIZ_NACIONAL]);
+        assert_eq!(
+            issuer_chain(MINISTERIO_DEL_INTERIOR, BUNDLED),
+            vec![RAIZ_NACIONAL.to_vec()]
+        );
     }
 }
