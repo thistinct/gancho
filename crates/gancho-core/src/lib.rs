@@ -4,6 +4,7 @@
 //! can be tested with a software key and driven by the cédula in production.
 
 pub mod appearance;
+mod ber;
 pub mod ca;
 pub mod cms;
 pub mod pdf;

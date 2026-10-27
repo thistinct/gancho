@@ -185,3 +185,59 @@ fn visible_signature_box() {
     assert!(text.contains("PRUEBA FIRMANTE"), "{text}");
     assert!(text.contains("Motivo: Conformidad"));
 }
+
+/// Some signers (TuID, for one) write the CMS in BER with indefinite
+/// lengths. Re-encode our own signature that way and check it still reads.
+#[test]
+fn ber_indefinite_length_signature_verifies() {
+    let mut signed = sign(SAMPLE);
+    // The hex string fills the gap the ByteRange leaves: `<` ... `>`.
+    let br = signed.windows(10).position(|w| w == b"/ByteRange").unwrap();
+    let nums: Vec<usize> = std::str::from_utf8(&signed[br + 10..br + 80])
+        .unwrap()
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|t| !t.is_empty())
+        .take(3)
+        .map(|t| t.parse().unwrap())
+        .collect();
+    let (start, end) = (nums[1] + 1, nums[2] - 1);
+    let hex = std::str::from_utf8(&signed[start..end]).unwrap();
+    let der: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+
+    // ContentInfo SEQUENCE { OID, [0] { SignedData } } with both outer
+    // constructed elements switched to indefinite length.
+    let (outer_hdr, outer_len) = header(&der);
+    let body = &der[outer_hdr..outer_hdr + outer_len];
+    let (oid_hdr, oid_len) = header(body);
+    let oid = &body[..oid_hdr + oid_len];
+    let explicit = &body[oid_hdr + oid_len..];
+    let (exp_hdr, exp_len) = header(explicit);
+    let mut ber = vec![0x30, 0x80];
+    ber.extend_from_slice(oid);
+    ber.extend_from_slice(&[0xA0, 0x80]);
+    ber.extend_from_slice(&explicit[exp_hdr..exp_hdr + exp_len]);
+    ber.extend_from_slice(&[0, 0, 0, 0]);
+
+    let new_hex: String = ber.iter().map(|b| format!("{b:02X}")).collect();
+    assert!(new_hex.len() <= end - start);
+    signed[start..start + new_hex.len()].copy_from_slice(new_hex.as_bytes());
+    for b in &mut signed[start + new_hex.len()..end] {
+        *b = b'0';
+    }
+    let r = &verify_pdf(&signed, &[ROOT], &[]).unwrap()[0];
+    assert_eq!(r.integrity, Ok(()));
+    assert!(r.is_valid());
+}
+
+/// DER header length and content length.
+fn header(b: &[u8]) -> (usize, usize) {
+    match b[1] {
+        n if n < 0x80 => (2, n as usize),
+        0x81 => (3, b[2] as usize),
+        0x82 => (4, u16::from_be_bytes([b[2], b[3]]) as usize),
+        _ => panic!("unexpected length"),
+    }
+}
