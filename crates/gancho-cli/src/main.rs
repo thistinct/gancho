@@ -7,12 +7,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use gancho_card::native::{self, NativeSigner, PinStatus};
 use gancho_card::pkcs11::Module;
 use gancho_core::Signer;
+use gancho_core::ca;
 use gancho_core::pdf::{SignOptions, sign_pdf};
+use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
 use rsa::signature::Verifier;
 use x509_cert::Certificate;
-use x509_cert::der::{Decode, Encode};
+use x509_cert::der::{Decode, DecodePem, Encode};
 
 #[derive(Parser)]
 #[command(
@@ -52,6 +54,18 @@ enum Command {
     SelfTest,
     /// Sign a PDF with the card (PAdES-B-B, as Adobe Reader expects).
     Sign(SignArgs),
+    /// Check the signatures in a PDF (no card needed).
+    Verify(VerifyArgs),
+}
+
+#[derive(clap::Args)]
+struct VerifyArgs {
+    /// Signed PDF to check.
+    input: PathBuf,
+    /// Extra CA certificate (DER or PEM) to accept; a self-signed one is
+    /// trusted as a root. Can be repeated.
+    #[arg(long = "ca", value_name = "FILE")]
+    cas: Vec<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -68,10 +82,17 @@ struct SignArgs {
     /// Location shown by PDF readers, e.g. "Montevideo".
     #[arg(long)]
     location: Option<String>,
+    /// Extra CA certificate (DER or PEM) to embed when it issued the
+    /// signer's certificate. Can be repeated.
+    #[arg(long = "ca", value_name = "FILE")]
+    cas: Vec<PathBuf>,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::Verify(args) = &cli.command {
+        return verify(args);
+    }
     let backend = if cli.module.is_some() {
         Backend::Pkcs11
     } else {
@@ -115,6 +136,7 @@ fn run_native(command: Command, reader: Option<&str>) -> Result<()> {
             let input = read_pdf(&args.input)?;
             sign_file(&mut native_signer(reader)?, &args, &input)?;
         }
+        Command::Verify(_) => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -158,6 +180,7 @@ fn run_pkcs11(command: Command, module_path: Option<PathBuf>) -> Result<()> {
             let mut signer = module.signer(slot, pin.into())?;
             sign_file(&mut signer, &args, &input)?;
         }
+        Command::Verify(_) => unreachable!("handled before loading the module"),
     }
     Ok(())
 }
@@ -183,9 +206,19 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         Some(p) => p.clone(),
         None => default_output(&args.input),
     };
+    let extra = read_certificates(&args.cas)?;
+    let mut pool: Vec<&[u8]> = ca::BUNDLED.to_vec();
+    pool.extend(extra.iter().map(Vec::as_slice));
+    let chain = ca::issuer_chain(signer.certificate_der(), &pool);
+    if chain.is_empty() {
+        eprintln!(
+            "note: the issuing CA certificate is not available, so PDF readers may show the signer as unverified"
+        );
+    }
     let options = SignOptions {
         reason: args.reason.clone(),
         location: args.location.clone(),
+        chain,
         ..Default::default()
     };
     let signed = sign_pdf(input, signer, &options)
@@ -193,6 +226,105 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
     std::fs::write(&output, signed).with_context(|| format!("writing {}", output.display()))?;
     println!("signed: {}", output.display());
     Ok(())
+}
+
+fn verify(args: &VerifyArgs) -> Result<()> {
+    let pdf = read_pdf(&args.input)?;
+    let extra = read_certificates(&args.cas)?;
+    let anchors: Vec<&[u8]> = extra
+        .iter()
+        .map(Vec::as_slice)
+        .filter(|der| ca::is_root(der))
+        .collect();
+    let mut cas: Vec<&[u8]> = extra.iter().map(Vec::as_slice).collect();
+    cas.retain(|c| !anchors.contains(c));
+    let reports = verify_pdf(&pdf, &anchors, &cas)?;
+    if reports.is_empty() {
+        bail!("{} has no signatures", args.input.display());
+    }
+    for (i, r) in reports.iter().enumerate() {
+        print_report(i + 1, r);
+    }
+    let bad = reports.iter().filter(|r| !r.is_valid()).count();
+    if bad > 0 {
+        bail!(
+            "{bad} of {} signatures did not fully validate",
+            reports.len()
+        );
+    }
+    match reports.len() {
+        1 => println!("the signature is valid"),
+        n => println!("all {n} signatures are valid"),
+    }
+    Ok(())
+}
+
+fn print_report(n: usize, r: &SignatureReport) {
+    let mark = |ok: bool| if ok { "ok" } else { "FAIL" };
+    println!(
+        "signature {n}: {}",
+        r.field.as_deref().unwrap_or("(unnamed field)")
+    );
+    if let Some(s) = &r.signer {
+        println!("  signer:    {s}");
+    }
+    if let Some(t) = &r.signed_at {
+        let shown = parse_pdf_date(t).map_or_else(|| t.clone(), format_utc);
+        println!("  time:      {shown} (claimed by the signer)");
+    }
+    if let Some(x) = &r.reason {
+        println!("  reason:    {x}");
+    }
+    if let Some(x) = &r.location {
+        println!("  location:  {x}");
+    }
+    match &r.integrity {
+        Ok(()) => println!("  integrity: ok"),
+        Err(e) => println!("  integrity: FAIL, {e}"),
+    }
+    if r.integrity.is_ok() {
+        println!(
+            "  coverage:  {}",
+            if r.covers_whole_file {
+                "whole document"
+            } else {
+                "the document was extended after this signature (e.g. another signature)"
+            }
+        );
+        for c in &r.chain {
+            println!("  issued by: {c}");
+        }
+        println!(
+            "  trust:     {}",
+            if r.trusted {
+                "ok, chains to a trusted root"
+            } else {
+                "FAIL, no path to a trusted root"
+            }
+        );
+        match r.valid_at_signing_time {
+            Some(ok) => println!("  dates:     {}", mark(ok)),
+            None => println!("  dates:     unknown (no signing time)"),
+        }
+    }
+    println!();
+}
+
+/// Reads certificates given as DER or PEM files.
+fn read_certificates(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    paths
+        .iter()
+        .map(|p| {
+            let bytes = std::fs::read(p).with_context(|| format!("reading {}", p.display()))?;
+            let cert = if bytes.starts_with(b"-----BEGIN") {
+                Certificate::from_pem(&bytes)
+            } else {
+                Certificate::from_der(&bytes)
+            }
+            .with_context(|| format!("{} is not an X.509 certificate", p.display()))?;
+            Ok(cert.to_der()?)
+        })
+        .collect()
 }
 
 /// `contrato.pdf` → `contrato-firmado.pdf`, in the same folder.
