@@ -17,7 +17,7 @@ The command sequence follows AGESIC's technical documentation as written up in [
 
 | Crate | Role |
 |---|---|
-| `gancho-core` | `Signer` trait; will hold CMS/CAdES and PDF/PAdES signing and verification. Has no PKCS#11 dependency, so it is tested with software keys. |
+| `gancho-core` | `Signer` trait, detached CMS (CAdES) signatures and PAdES-B-B PDF signing; verification to come. Has no card dependency, so it is tested with software keys. |
 | `gancho-card` | Card access. `native`: direct PC/SC (`pcsc` crate), tested against a simulated card. `pkcs11`: through an installed module (`cryptoki`). Both implement `Signer`. |
 | `gancho-cli` | The `gancho` binary. |
 | `gancho-desktop` | *(planned)* Tauri 2 app reusing the same crates. |
@@ -30,7 +30,10 @@ Install Rust (<https://rustup.rs>), plug in the reader, insert the cédula, then
 cargo run -p gancho -- devices     # readers and whether a card is inserted
 cargo run -p gancho -- certs       # the signing certificate (no PIN needed)
 cargo run -p gancho -- self-test   # asks for the PIN, signs a test message, verifies it
+cargo run -p gancho -- sign contrato.pdf   # writes contrato-firmado.pdf
 ```
+
+`sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 
@@ -39,7 +42,7 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 ## Roadmap
 
 1. **Card access** (done): `devices`, `certs`, `self-test`, directly or via PKCS#11.
-2. **PDF signing, PAdES-B-B**: incremental update with a signature field, `/ByteRange` placeholder, `/SubFilter /ETSI.CAdES.detached`; detached CMS SignedData with `contentType`, `messageDigest` and `signingCertificateV2` signed attributes (`cms`, `x509-cert`, `lopdf` for parsing).
+2. **PDF signing, PAdES-B-B** (done): `sign`. Incremental update with a signature field, `/ByteRange` placeholder, `/SubFilter /ETSI.CAdES.detached`; detached CMS SignedData with `contentType`, `messageDigest` and `signingCertificateV2` signed attributes (`cms`, `x509-cert`, `lopdf`). The CA chain is not embedded yet.
 3. **Verification**: check the CMS signature, the byte range, and the chain against the bundled ACRN and Ministerio del Interior CA certificates.
 4. **Timestamps and long-term validation**: optional RFC 3161 TSA (PAdES-B-T), then a DSS dictionary with the chain and CRLs (PAdES-B-LT).
 5. **Visible signature** appearance.

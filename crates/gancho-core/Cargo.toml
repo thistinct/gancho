@@ -4,4 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cms = "0.2"
+der = { version = "0.7", features = ["oid", "alloc"] }
+lopdf = { version = "0.45", default-features = false }
+sha2 = "0.10"
 thiserror = "2.0.21"
+x509-cert = "0.2"
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["sha2"] }
