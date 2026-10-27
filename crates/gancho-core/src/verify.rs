@@ -15,7 +15,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 
-use crate::ca;
+use crate::{ber, ca};
 
 const ID_SHA256: &str = "2.16.840.1.101.3.4.2.1";
 const ID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
@@ -200,9 +200,10 @@ fn check_cms(
     digest: &[u8],
 ) -> Result<(Certificate, Vec<Vec<u8>>), IntegrityError> {
     let cms_err = |e: der::Error| IntegrityError::Cms(e.to_string());
-    let info =
-        ContentInfo::from_der(trim_der(contents).ok_or(IntegrityError::Cms("bad length".into()))?)
-            .map_err(cms_err)?;
+    let info = ContentInfo::from_der(
+        &ber::to_der(contents).ok_or(IntegrityError::Cms("malformed encoding".into()))?,
+    )
+    .map_err(cms_err)?;
     let sd: SignedData = info.content.decode_as().map_err(cms_err)?;
     let si = sd
         .signer_infos
@@ -298,23 +299,6 @@ fn decode_text(b: &[u8]) -> String {
     } else {
         b.iter().map(|&c| c as char).collect()
     }
-}
-
-/// The DER prefix of a zero-padded `/Contents` value.
-fn trim_der(b: &[u8]) -> Option<&[u8]> {
-    let (hdr, len) = match *b.get(1)? {
-        n if n < 0x80 => (2, n as usize),
-        n @ 0x81..=0x84 => {
-            let k = (n & 0x7F) as usize;
-            let len = b
-                .get(2..2 + k)?
-                .iter()
-                .fold(0usize, |acc, x| acc << 8 | *x as usize);
-            (2 + k, len)
-        }
-        _ => return None,
-    };
-    b.get(..hdr + len)
 }
 
 fn valid_at(cert: &Certificate, unix: i64) -> bool {
