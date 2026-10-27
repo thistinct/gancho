@@ -7,9 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 gancho-card = { version = "0.1.0", path = "../gancho-card" }
-gancho-core = { version = "0.1.0", path = "../gancho-core" }
+gancho-core = { version = "0.1.0", path = "../gancho-core", features = ["http"] }
 rpassword = "7.5.4"
 rsa = { version = "0.9", features = ["sha2"] }
 sha2 = "0.10"
-ureq = "3.1"
 x509-cert = { version = "0.3.0", features = ["pem"] }

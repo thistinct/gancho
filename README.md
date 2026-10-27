@@ -20,7 +20,7 @@ The command sequence follows AGESIC's technical documentation as written up in [
 | `gancho-core` | `Signer` trait, detached CMS (CAdES) signatures, PAdES-B-B PDF signing and verification, CA path building. Has no card dependency, so it is tested with software keys. |
 | `gancho-card` | Card access. `native`: direct PC/SC (`pcsc` crate), tested against a simulated card. `pkcs11`: through an installed module (`cryptoki`). Both implement `Signer`. |
 | `gancho-cli` | The `gancho` binary. |
-| `gancho-desktop` | *(planned)* Tauri 2 app reusing the same crates. |
+| `gancho-desktop` | Tauri 2 window (plain HTML in `ui/`, logic in Rust): card status, sign with PIN, verify. |
 
 ## Try it
 
@@ -35,13 +35,21 @@ cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firma
 
 `sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid. The issuing CA certificates are embedded so readers can connect the signer to the national root.
 
-Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
+Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it). Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
 
 ```sh
 cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 ```
 
 `verify` checks each signature's integrity, whether the document was extended after it, the certificate path up to AC Raíz Nacional, and the certificate dates at the signing time, and any timestamp. Revocation is not checked yet. Both commands take `--ca FILE` (DER or PEM, repeatable) for extra CA certificates; a self-signed one passed to `verify` is trusted as a root.
+
+### Desktop app
+
+```sh
+cargo run -p gancho-desktop
+```
+
+It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 
@@ -53,6 +61,6 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 2. **PDF signing, PAdES-B-B** (done): `sign`. Incremental update with a signature field, `/ByteRange` placeholder, `/SubFilter /ETSI.CAdES.detached`; detached CMS SignedData with `contentType`, `messageDigest` and `signingCertificateV2` signed attributes (`cms`, `x509-cert`, `lopdf`).
 3. **Verification** (done): `verify`. Checks the CMS signature, the byte range, and the chain against the bundled ACRN and Ministerio del Interior CA certificates.
 4. **Timestamps** (done): `sign --tsa URL` (PAdES-B-T). **Long-term validation** next: a DSS dictionary with the chain and CRLs (PAdES-B-LT).
-5. **Visible signature** appearance.
-6. **Desktop app** (Tauri 2): pick file, show certificate, enter PIN, sign, verify.
+5. **Visible signature** (done): `sign --visible`.
+6. **Desktop app** (done, Tauri 2): pick file, show certificate, enter PIN, sign, verify.
 7. Packaging per OS, plus CAdES `.p7s` for arbitrary files.

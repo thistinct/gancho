@@ -1,0 +1,15 @@
+[package]
+name = "gancho-desktop"
+version = "0.1.0"
+edition = "2024"
+description = "Desktop app for signing PDFs with the Uruguayan electronic ID card"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+gancho-card = { path = "../gancho-card" }
+gancho-core = { path = "../gancho-core", features = ["http"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"

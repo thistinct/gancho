@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
-members = ["crates/gancho-core", "crates/gancho-card", "crates/gancho-cli"]
+members = [
+    "crates/gancho-core",
+    "crates/gancho-card",
+    "crates/gancho-cli",
+    "crates/gancho-desktop",
+]
+# The desktop app needs a system web view toolkit to build on Linux
+# (webkit2gtk), so plain `cargo build` / `cargo test` leave it out; build
+# it with `cargo run -p gancho-desktop`.
+default-members = ["crates/gancho-core", "crates/gancho-card", "crates/gancho-cli"]
 
 [workspace.package]
 edition = "2024"
