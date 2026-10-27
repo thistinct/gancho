@@ -231,3 +231,11 @@ fn second_signature_keeps_the_first_valid() {
     save_for_inspection("twice.pdf", &twice);
     let _ = CERT.to_vec().len();
 }
+
+#[test]
+fn signs_the_repository_sample() {
+    let original = include_bytes!("../../../samples/ejemplo.pdf");
+    let signed = sign_pdf(original, &mut signer(), &SignOptions::default()).unwrap();
+    check_signature(original, &signed);
+    save_for_inspection("ejemplo.pdf", &signed);
+}

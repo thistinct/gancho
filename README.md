@@ -30,7 +30,7 @@ Install Rust (<https://rustup.rs>), plug in the reader, insert the cédula, then
 cargo run -p gancho -- devices     # readers and whether a card is inserted
 cargo run -p gancho -- certs       # the signing certificate (no PIN needed)
 cargo run -p gancho -- self-test   # asks for the PIN, signs a test message, verifies it
-cargo run -p gancho -- sign contrato.pdf   # writes contrato-firmado.pdf
+cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firmado.pdf
 ```
 
 `sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid.
