@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cmpv2 = "0.2"
 cms = "0.2"
 der = { version = "0.7", features = ["oid", "alloc"] }
 lopdf = { version = "0.45", default-features = false }
@@ -12,3 +13,4 @@ sha1 = { version = "0.10", features = ["oid"] }
 sha2 = { version = "0.10", features = ["oid"] }
 thiserror = "2.0.21"
 x509-cert = "0.2"
+x509-tsp = "0.1"

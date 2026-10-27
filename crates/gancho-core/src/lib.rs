@@ -6,6 +6,7 @@
 pub mod ca;
 pub mod cms;
 pub mod pdf;
+pub mod tsp;
 pub mod verify;
 
 /// Something that holds a certificate and can produce RSA PKCS#1 v1.5
