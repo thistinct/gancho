@@ -92,3 +92,21 @@ button.link { border: none; background: none; color: var(--accent); padding: 0; 
   overflow-wrap: anywhere;
   font: 12px/1.4 ui-monospace, Menlo, monospace;
 }
+.files { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: 6px; }
+.files li { display: flex; align-items: center; gap: 10px; padding: 6px 10px; }
+.files li + li { border-top: 1px solid var(--border); }
+.files li span { flex: 1; overflow-wrap: anywhere; }
+.results { margin: 6px 0 0; padding: 0; list-style: none; }
+.results li + li { margin-top: 4px; }
+#drop-overlay {
+  position: fixed;
+  inset: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  pointer-events: none;
+}
+#drop-overlay p { font-size: 18px; font-weight: 600; color: var(--accent); }

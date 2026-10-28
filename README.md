@@ -33,7 +33,9 @@ cargo run -p gancho -- self-test   # asks for the PIN, signs a test message, ver
 cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firmado.pdf
 ```
 
-`sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid. The issuing CA certificates are embedded so readers can connect the signer to the national root.
+Several files sign with a single PIN entry: `gancho sign a.pdf b.pdf c.pdf` writes each `-firmado.pdf` next to its original, or into `--output-dir DIR`. Every path is checked before the PIN is asked for; a file that can't be signed is reported and the rest carry on, while a card, PIN or timestamp server error stops the batch.
+
+`sign` also takes `-o OUT.pdf` (single file), `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid. The issuing CA certificates are embedded so readers can connect the signer to the national root.
 
 Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it). Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
 
@@ -49,7 +51,7 @@ cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 cargo run -p gancho-desktop
 ```
 
-It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
+It shows the cédula's holder, validity and PIN tries; signs one or more PDFs with a single PIN entry (reason, location, visible box and timestamp optional), next to each original as `-firmado.pdf` or into a chosen folder; and verifies signed PDFs. PDFs can be dropped onto the window (on the Firmar tab they join the list to sign, on Verificar the PDF is checked). The installers register Gancho for PDFs, so "Open with › Gancho" in Finder, Explorer or the Linux file manager (or dropping a PDF on the Dock icon) adds it to the signing list; a second launch hands its files to the window that's already open. Gancho registers as an alternative PDF app and doesn't take over as the default viewer. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 
