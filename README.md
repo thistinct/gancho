@@ -49,7 +49,7 @@ cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 cargo run -p gancho-desktop
 ```
 
-It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
+It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`, with a page preview where you pick the page and drag or resize the visible box (drawn with pdf.js, vendored in `ui/vendor/pdfjs`, Apache-2.0); and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 

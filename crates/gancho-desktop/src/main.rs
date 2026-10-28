@@ -116,6 +116,10 @@ struct SignRequest {
     reason: Option<String>,
     location: Option<String>,
     visible: bool,
+    /// Where the user placed the box: 1-based page and `[x1, y1, x2, y2]`
+    /// in PDF points. Without them the box goes in the default spot.
+    page: Option<u32>,
+    rect: Option<[f32; 4]>,
     /// Timestamp server URL, when wanted.
     tsa: Option<String>,
 }
@@ -212,7 +216,10 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
             reason: non_empty(request.reason),
             location: non_empty(request.location),
             chain: ca::issuer_chain(signer.certificate_der(), ca::BUNDLED),
-            appearance: request.visible.then(Appearance::default),
+            appearance: request.visible.then(|| Appearance {
+                page: request.page,
+                rect: request.rect.filter(usable_rect),
+            }),
             ..Default::default()
         };
         let mut tsa = non_empty(request.tsa).map(HttpTsa);
@@ -223,6 +230,23 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
         std::fs::write(&request.output, signed)
             .map_err(|e| UiError::with_details("No se pudo guardar el PDF firmado.", e))?;
         Ok(request.output)
+    })
+    .await
+}
+
+/// A box the window could have produced: finite, not inverted, and big
+/// enough to hold text.
+fn usable_rect([x1, y1, x2, y2]: &[f32; 4]) -> bool {
+    [x1, y1, x2, y2].iter().all(|v| v.is_finite()) && x2 - x1 >= 10.0 && y2 - y1 >= 10.0
+}
+
+/// The PDF's bytes, for the page preview where the signature is placed.
+#[tauri::command]
+async fn read_pdf(path: PathBuf) -> Result<tauri::ipc::Response> {
+    blocking(move || {
+        std::fs::read(&path)
+            .map(tauri::ipc::Response::new)
+            .map_err(|e| UiError::with_details("No se pudo abrir el PDF.", e))
     })
     .await
 }
@@ -323,7 +347,13 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![card, default_output, sign, verify])
+        .invoke_handler(tauri::generate_handler![
+            card,
+            default_output,
+            read_pdf,
+            sign,
+            verify
+        ])
         .run(tauri::generate_context!())
         .expect("error while running the Gancho window");
 }
@@ -355,6 +385,14 @@ mod tests {
             "La cédula no responde. Sacala del lector, volvé a ponerla y tocá Actualizar."
         );
         assert!(e.details.unwrap().contains("YubiKey"));
+    }
+
+    #[test]
+    fn placed_boxes() {
+        assert!(usable_rect(&[36.0, 36.0, 256.0, 106.0]));
+        assert!(!usable_rect(&[256.0, 36.0, 36.0, 106.0]));
+        assert!(!usable_rect(&[36.0, 36.0, 40.0, 106.0]));
+        assert!(!usable_rect(&[f32::NAN, 36.0, 256.0, 106.0]));
     }
 
     #[test]

@@ -44,7 +44,26 @@
 
     <label>Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
     <label>Lugar <input id="location" placeholder="Montevideo (opcional)"></label>
-    <label class="check"><input type="checkbox" id="visible" checked> Mostrar la firma en la última página</label>
+    <label class="check"><input type="checkbox" id="visible" checked> Mostrar la firma en el documento</label>
+    <div id="placement" class="placement" hidden>
+      <div class="pager">
+        <button type="button" id="page-prev" aria-label="Página anterior">‹</button>
+        <span id="page-label" class="muted"></span>
+        <button type="button" id="page-next" aria-label="Página siguiente">›</button>
+      </div>
+      <div class="page-view" id="page-view">
+        <div class="sheet" id="sheet">
+          <canvas id="page-canvas"></canvas>
+          <div class="sig-box" id="sig-box" tabindex="0" role="group"
+               aria-label="Recuadro de la firma. Movelo con las flechas; con Mayúsculas cambia el tamaño.">
+            <span>Firmado digitalmente por</span>
+            <strong id="sig-name">tu nombre</strong>
+            <div class="sig-handle" id="sig-handle" aria-hidden="true"></div>
+          </div>
+        </div>
+      </div>
+      <p class="muted hint" id="placement-hint">Arrastrá el recuadro hasta donde va la firma. Tirá de la esquina para cambiar el tamaño.</p>
+    </div>
     <label class="check"><input type="checkbox" id="use-tsa"> Agregar sello de tiempo</label>
     <label id="tsa-row" hidden>Servidor de sello de tiempo <input id="tsa" value="http://timestamp.digicert.com"></label>
 
