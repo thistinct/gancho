@@ -1,4 +1,5 @@
-//! Checking the signatures in a PDF.
+//! Checking the signatures in a PDF, or a detached `.p7s` signature
+//! over any file.
 //!
 //! For each signature this checks that the signed bytes are intact (the
 //! `/ByteRange` digest matches the CMS `message-digest`, and the CMS
@@ -14,12 +15,14 @@ use der::asn1::OctetString;
 use der::{Decode, Encode};
 use lopdf::{Dictionary, Document, Object, ObjectId};
 use x509_cert::Certificate;
+use x509_cert::time::Time;
 use x509_tsp::TstInfo;
 
 use crate::ber;
 use crate::ca::{self, Hash};
 
 const ID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+const ID_SIGNING_TIME: &str = "1.2.840.113549.1.9.5";
 const ID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
 const ID_SIGNATURE_TIME_STAMP_TOKEN: &str = "1.2.840.113549.1.9.16.2.14";
 
@@ -27,6 +30,8 @@ const ID_SIGNATURE_TIME_STAMP_TOKEN: &str = "1.2.840.113549.1.9.16.2.14";
 pub enum VerifyError {
     #[error("could not read the PDF: {0}")]
     Parse(lopdf::Error),
+    #[error("the signature does not include the signed file; give the original file too")]
+    NoContent,
 }
 
 /// Why a signature's (or timestamp's) bytes don't check out.
@@ -71,14 +76,15 @@ impl TimestampReport {
     }
 }
 
-/// One signature found in the PDF.
+/// One signature found in a PDF, or a detached signature.
 #[derive(Debug, Clone)]
 pub struct SignatureReport {
-    /// Form field name, e.g. "Firma".
+    /// Form field name, e.g. "Firma" (`None` for a detached signature).
     pub field: Option<String>,
     /// `/SubFilter`, e.g. "ETSI.CAdES.detached".
     pub sub_filter: Option<String>,
-    /// Claimed signing time from `/M`, as written in the PDF.
+    /// Claimed signing time as a PDF date: `/M` as written in the PDF, or
+    /// a detached signature's `signing-time` attribute.
     pub signed_at: Option<String>,
     pub reason: Option<String>,
     pub location: Option<String>,
@@ -87,7 +93,8 @@ pub struct SignatureReport {
     /// Whether the signed bytes and the cryptographic signature check out.
     pub integrity: Result<(), IntegrityError>,
     /// False when the file has later revisions appended after this
-    /// signature (for example, another signature).
+    /// signature (for example, another signature). Always true for a
+    /// detached signature.
     pub covers_whole_file: bool,
     /// Subjects from the signer's issuer up to the top of the path found.
     pub chain: Vec<String>,
@@ -123,27 +130,8 @@ pub fn verify_pdf(
 ) -> Result<Vec<SignatureReport>, VerifyError> {
     let doc = Document::load_mem(pdf).map_err(VerifyError::Parse)?;
     let names = field_names(&doc);
-    let mut anchors: Vec<&[u8]> = anchors.to_vec();
-    anchors.extend(ca::bundled_roots());
-    let mut intermediates: Vec<&[u8]> = intermediates.to_vec();
-    intermediates.extend(ca::BUNDLED);
-    let trust = Trust {
-        anchors: &anchors,
-        intermediates: &intermediates,
-    };
-    let tsa_anchors: Vec<&[u8]> = anchors
-        .iter()
-        .copied()
-        .chain(
-            webpki_root_certs::TLS_SERVER_ROOT_CERTS
-                .iter()
-                .map(|c| c.as_ref()),
-        )
-        .collect();
-    let tsa_trust = Trust {
-        anchors: &tsa_anchors,
-        intermediates: &intermediates,
-    };
+    let store = TrustStore::new(anchors, intermediates);
+    let (trust, tsa_trust) = (store.trust(), store.tsa_trust());
 
     let mut sigs: Vec<(ObjectId, &Dictionary)> = doc
         .objects
@@ -158,6 +146,142 @@ pub fn verify_pdf(
         .into_iter()
         .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &trust, &tsa_trust))
         .collect())
+}
+
+/// Checks a detached CMS/CAdES signature (a `.p7s` file, DER or PEM)
+/// over `content`, the signed file. `content` may be `None` when the
+/// signature carries the file inside it. Trust works as in [`verify_pdf`].
+pub fn verify_detached(
+    signature: &[u8],
+    content: Option<&[u8]>,
+    anchors: &[&[u8]],
+    intermediates: &[&[u8]],
+) -> Result<SignatureReport, VerifyError> {
+    let store = TrustStore::new(anchors, intermediates);
+    let mut report = SignatureReport {
+        field: None,
+        sub_filter: None,
+        signed_at: None,
+        reason: None,
+        location: None,
+        signer: None,
+        integrity: Ok(()),
+        covers_whole_file: true,
+        chain: Vec::new(),
+        trusted: false,
+        valid_at_signing_time: None,
+        timestamp: None,
+    };
+    let sd = match parse_signed_data(&unpem(signature)) {
+        Ok(sd) => sd,
+        Err(e) => {
+            report.integrity = Err(e);
+            return Ok(report);
+        }
+    };
+    let encapsulated = match &sd.encap_content_info.econtent {
+        Some(e) => match e.decode_as::<OctetString>() {
+            Ok(o) => Some(o.into_bytes()),
+            Err(e) => {
+                report.integrity = Err(IntegrityError::Cms(e.to_string()));
+                return Ok(report);
+            }
+        },
+        None => None,
+    };
+    let content = encapsulated
+        .as_deref()
+        .or(content)
+        .ok_or(VerifyError::NoContent)?;
+    match check_signed_data(&sd, &[content]) {
+        Ok(checked) => {
+            let claimed = signing_time(&checked.signer_info);
+            report.signed_at = claimed.map(|t| {
+                crate::pdf::pdf_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t))
+            });
+            fill_trust(
+                &mut report,
+                &checked,
+                claimed.map(|t| t as i64),
+                &store.trust(),
+                &store.tsa_trust(),
+            );
+        }
+        Err(e) => report.integrity = Err(e),
+    }
+    Ok(report)
+}
+
+/// PEM (`-----BEGIN PKCS7-----`, as `openssl` writes) to DER; anything
+/// else is returned as is.
+fn unpem(b: &[u8]) -> Vec<u8> {
+    let text = b.trim_ascii_start();
+    if text.starts_with(b"-----BEGIN")
+        && let Ok((_, der)) = der::pem::decode_vec(text)
+    {
+        return der;
+    }
+    b.to_vec()
+}
+
+/// The `signing-time` signed attribute, Unix seconds.
+fn signing_time(si: &SignerInfo) -> Option<u64> {
+    let time = si
+        .signed_attrs
+        .as_ref()?
+        .iter()
+        .find(|a| a.oid.to_string() == ID_SIGNING_TIME)?
+        .values
+        .iter()
+        .next()?
+        .to_der()
+        .ok()?;
+    let time = Time::from_der(&time).ok()?;
+    Some(time.to_unix_duration().as_secs())
+}
+
+/// The trust anchors and CA pools for the signer and for timestamps.
+struct TrustStore<'a> {
+    anchors: Vec<&'a [u8]>,
+    intermediates: Vec<&'a [u8]>,
+    tsa_anchors: Vec<&'a [u8]>,
+}
+
+impl<'a> TrustStore<'a> {
+    fn new(anchors: &[&'a [u8]], intermediates: &[&'a [u8]]) -> Self {
+        let mut anchors: Vec<&[u8]> = anchors.to_vec();
+        anchors.extend(ca::bundled_roots());
+        let mut intermediates: Vec<&[u8]> = intermediates.to_vec();
+        intermediates.extend(ca::BUNDLED);
+        let tsa_anchors = anchors
+            .iter()
+            .copied()
+            .chain(
+                webpki_root_certs::TLS_SERVER_ROOT_CERTS
+                    .iter()
+                    .map(|c| c.as_ref()),
+            )
+            .collect();
+        Self {
+            anchors,
+            intermediates,
+            tsa_anchors,
+        }
+    }
+
+    fn trust(&self) -> Trust<'_> {
+        Trust {
+            anchors: &self.anchors,
+            intermediates: &self.intermediates,
+        }
+    }
+
+    fn tsa_trust(&self) -> Trust<'_> {
+        Trust {
+            anchors: &self.tsa_anchors,
+            intermediates: &self.intermediates,
+        }
+    }
 }
 
 struct Trust<'a> {
@@ -242,6 +366,21 @@ fn check_one(
         }
     };
 
+    let claimed = signed_at.as_deref().and_then(parse_pdf_date);
+    fill_trust(&mut report, &checked, claimed, trust, tsa_trust);
+    report
+}
+
+/// Fills in the signer, its chain and trust, and the timestamp, for an
+/// intact signature. `claimed` is the signer's own signing time, used for
+/// the validity dates when there is no trusted timestamp.
+fn fill_trust(
+    report: &mut SignatureReport,
+    checked: &Checked,
+    claimed: Option<i64>,
+    trust: &Trust,
+    tsa_trust: &Trust,
+) {
     report.signer = Some(checked.signer.tbs_certificate.subject.to_string());
     let (path, trusted) = trust.path(&checked.signer, &checked.certs);
     report.trusted = trusted;
@@ -254,9 +393,8 @@ fn check_one(
         .timestamp
         .as_ref()
         .and_then(TimestampReport::trusted_time)
-        .or_else(|| signed_at.as_deref().and_then(parse_pdf_date));
+        .or(claimed);
     report.valid_at_signing_time = time.map(|t| path.iter().all(|c| valid_at(c, t)));
-    report
 }
 
 /// Checks the `signature-time-stamp` unsigned attribute, if present.

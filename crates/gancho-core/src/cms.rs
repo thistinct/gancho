@@ -2,21 +2,25 @@
 //! (ETSI EN 319 142-1, building on CAdES / ETSI EN 319 122-1).
 //!
 //! Signed attributes: `content-type` (id-data), `message-digest`, and
-//! `signing-certificate-v2`. There is deliberately no `signing-time`
-//! attribute: PAdES carries the claimed signing time in the signature
-//! dictionary's `/M` entry instead.
+//! `signing-certificate-v2`. For PDFs there is deliberately no
+//! `signing-time` attribute: PAdES carries the claimed signing time in the
+//! signature dictionary's `/M` entry instead. Stand-alone CAdES signatures
+//! ([`cades_detached`]) do carry `signing-time`, as CAdES-B-B requires.
 
 use cms::cert::{CertificateChoices, IssuerAndSerialNumber};
 use cms::content_info::{CmsVersion, ContentInfo};
 use cms::signed_data::{
     CertificateSet, EncapsulatedContentInfo, SignedData, SignerIdentifier, SignerInfo, SignerInfos,
 };
-use der::asn1::{Any, ObjectIdentifier, OctetString, SetOfVec};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use der::asn1::{Any, GeneralizedTime, ObjectIdentifier, OctetString, SetOfVec, UtcTime};
 use der::{Decode, Encode};
 use sha2::{Digest, Sha256};
 use x509_cert::Certificate;
 use x509_cert::attr::Attribute;
 use x509_cert::spki::AlgorithmIdentifierOwned;
+use x509_cert::time::Time;
 
 use crate::tsp::{TimestampAuthority, TspError, fetch_token};
 use crate::{SignError, Signer};
@@ -25,6 +29,7 @@ const ID_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1
 const ID_SIGNED_DATA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.7.2");
 const ID_CONTENT_TYPE: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.3");
 const ID_MESSAGE_DIGEST: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.4");
+const ID_SIGNING_TIME: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.5");
 const ID_SIGNING_CERTIFICATE_V2: ObjectIdentifier =
     ObjectIdentifier::new_unwrap("1.2.840.113549.1.9.16.2.47");
 const ID_SHA256: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
@@ -42,6 +47,8 @@ pub enum CmsError {
     Sign(#[from] SignError),
     #[error(transparent)]
     Timestamp(#[from] TspError),
+    #[error("the signing time cannot be encoded")]
+    Time,
 }
 
 /// Builds a DER `ContentInfo` holding a detached `SignedData` over content
@@ -52,6 +59,29 @@ pub fn signed_data_detached(
     signer: &mut dyn Signer,
     content_digest: &[u8; 32],
     chain: &[Vec<u8>],
+    tsa: Option<&mut dyn TimestampAuthority>,
+) -> Result<Vec<u8>, CmsError> {
+    build(signer, content_digest, chain, None, tsa)
+}
+
+/// Like [`signed_data_detached`], with a `signing-time` attribute: a
+/// CAdES-B-B detached signature (`.p7s`) for content of any type, or
+/// CAdES-B-T with a `tsa`.
+pub fn cades_detached(
+    signer: &mut dyn Signer,
+    content_digest: &[u8; 32],
+    chain: &[Vec<u8>],
+    signing_time: SystemTime,
+    tsa: Option<&mut dyn TimestampAuthority>,
+) -> Result<Vec<u8>, CmsError> {
+    build(signer, content_digest, chain, Some(signing_time), tsa)
+}
+
+fn build(
+    signer: &mut dyn Signer,
+    content_digest: &[u8; 32],
+    chain: &[Vec<u8>],
+    signing_time: Option<SystemTime>,
     tsa: Option<&mut dyn TimestampAuthority>,
 ) -> Result<Vec<u8>, CmsError> {
     let cert_der = signer.certificate_der().to_vec();
@@ -71,6 +101,18 @@ pub fn signed_data_detached(
         ID_SIGNING_CERTIFICATE_V2,
         Any::from_der(&signing_certificate_v2(&cert, &cert_der)?)?,
     ))?;
+    if let Some(t) = signing_time {
+        // RFC 5652 11.3: UTCTime through 2049, GeneralizedTime after.
+        let since_epoch = t.duration_since(UNIX_EPOCH).map_err(|_| CmsError::Time)?;
+        let since_epoch = std::time::Duration::from_secs(since_epoch.as_secs());
+        let dt = der::DateTime::from_unix_duration(since_epoch).map_err(|_| CmsError::Time)?;
+        let time = if dt.year() < 2050 {
+            Time::from(UtcTime::from_date_time(dt)?)
+        } else {
+            Time::from(GeneralizedTime::from_date_time(dt))
+        };
+        signed_attrs.insert(attribute(ID_SIGNING_TIME, Any::encode_from(&time)?))?;
+    }
 
     // The signature covers the DER of the attributes as a SET OF (tag 0x31),
     // not the [0] IMPLICIT form they take inside SignerInfo (RFC 5652 5.4).

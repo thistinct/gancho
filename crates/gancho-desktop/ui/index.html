@@ -10,7 +10,7 @@
 <body>
   <header>
     <h1>Gancho</h1>
-    <p>Firmá PDFs con tu cédula de identidad.</p>
+    <p>Firmá PDFs y otros archivos con tu cédula de identidad.</p>
   </header>
 
   <section class="card" id="card">
@@ -33,7 +33,7 @@
 
   <form id="sign" class="panel" autocomplete="off">
     <div class="row">
-      <button type="button" id="pick-input">Elegir PDF…</button>
+      <button type="button" id="pick-input">Elegir archivo…</button>
       <span id="input-name" class="muted">Ningún archivo elegido</span>
     </div>
     <div class="row" id="output-row" hidden>
@@ -42,9 +42,10 @@
       <button type="button" class="link" id="pick-output">Cambiar…</button>
     </div>
 
-    <label>Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
-    <label>Lugar <input id="location" placeholder="Montevideo (opcional)"></label>
-    <label class="check"><input type="checkbox" id="visible" checked> Mostrar la firma en la última página</label>
+    <p id="detached-note" class="muted" hidden>No es un PDF, así que la firma se guarda en un archivo aparte (.p7s) y el original no cambia. Para verificarla hacen falta los dos archivos.</p>
+    <label class="pdf-only">Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
+    <label class="pdf-only">Lugar <input id="location" placeholder="Montevideo (opcional)"></label>
+    <label class="check pdf-only"><input type="checkbox" id="visible" checked> Mostrar la firma en la última página</label>
     <label class="check"><input type="checkbox" id="use-tsa"> Agregar sello de tiempo</label>
     <label id="tsa-row" hidden>Servidor de sello de tiempo <input id="tsa" value="http://timestamp.digicert.com"></label>
 
@@ -55,7 +56,7 @@
 
   <section id="verify" class="panel" hidden>
     <div class="row">
-      <button type="button" id="pick-verify">Elegir PDF firmado…</button>
+      <button type="button" id="pick-verify">Elegir PDF o firma .p7s…</button>
       <span id="verify-name" class="muted">No necesita la cédula</span>
     </div>
     <div id="verify-result" role="status"></div>

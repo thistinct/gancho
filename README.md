@@ -17,7 +17,7 @@ The command sequence follows AGESIC's technical documentation as written up in [
 
 | Crate | Role |
 |---|---|
-| `gancho-core` | `Signer` trait, detached CMS (CAdES) signatures, PAdES-B-B PDF signing and verification, CA path building. Has no card dependency, so it is tested with software keys. |
+| `gancho-core` | `Signer` trait, detached CMS (CAdES) signatures for any file, PAdES-B-B PDF signing and verification, CA path building. Has no card dependency, so it is tested with software keys. |
 | `gancho-card` | Card access. `native`: direct PC/SC (`pcsc` crate), tested against a simulated card. `pkcs11`: through an installed module (`cryptoki`). Both implement `Signer`. |
 | `gancho-cli` | The `gancho` binary. |
 | `gancho-desktop` | Tauri 2 window (plain HTML in `ui/`, logic in Rust): card status, sign with PIN, verify. |
@@ -37,11 +37,17 @@ cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firma
 
 Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it). Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
 
+Any other kind of file (Word, Excel, images, ZIPs…) gets a detached signature in a separate `.p7s` file next to it, leaving the original untouched (CAdES-B-B, or B-T with `--tsa`). `--detached` does the same for a PDF.
+
+```sh
+cargo run -p gancho -- sign contrato.docx   # writes contrato.docx.p7s
+```
+
 ```sh
 cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 ```
 
-`verify` checks each signature's integrity, whether the document was extended after it, the certificate path up to AC Raíz Nacional, and the certificate dates at the signing time, and any timestamp. Revocation is not checked yet. Both commands take `--ca FILE` (DER or PEM, repeatable) for extra CA certificates; a self-signed one passed to `verify` is trusted as a root.
+`verify` also takes a `.p7s` (or the signed file, when its `.p7s` is next to it; `--data FILE` names the signed file otherwise). It checks each signature's integrity, whether the document was extended after it, the certificate path up to AC Raíz Nacional, and the certificate dates at the signing time, and any timestamp. Revocation is not checked yet. Both commands take `--ca FILE` (DER or PEM, repeatable) for extra CA certificates; a self-signed one passed to `verify` is trusted as a root.
 
 ### Desktop app
 
@@ -49,7 +55,7 @@ cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 cargo run -p gancho-desktop
 ```
 
-It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
+It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`, or any other file into a `.p7s` next to it; and verifies signed PDFs and `.p7s` signatures. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 
@@ -63,4 +69,5 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 4. **Timestamps** (done): `sign --tsa URL` (PAdES-B-T). **Long-term validation** next: a DSS dictionary with the chain and CRLs (PAdES-B-LT).
 5. **Visible signature** (done): `sign --visible`.
 6. **Desktop app** (done, Tauri 2): pick file, show certificate, enter PIN, sign, verify.
+7. **Any file type** (done): detached CAdES `.p7s` signatures, signed and verified by the CLI and the app; interoperable with `openssl cms`.
 7. Packaging per OS, plus CAdES `.p7s` for arbitrary files.

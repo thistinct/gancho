@@ -462,7 +462,7 @@ fn hex_upper(bytes: &[u8]) -> String {
 }
 
 /// `D:YYYYMMDDHHmmSSZ` in UTC.
-fn pdf_date(t: SystemTime) -> String {
+pub(crate) fn pdf_date(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
