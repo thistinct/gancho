@@ -28,6 +28,8 @@ Installers for the desktop app (macOS `.dmg`, Windows `.msi`/`-setup.exe`, Linux
 
 To cut a release, set the same version in `crates/gancho-desktop/tauri.conf.json` and `crates/gancho-cli/Cargo.toml`, then push a tag `vX.Y.Z`. The `Release` workflow builds everything and attaches it to a draft release to publish by hand. Signing and notarization are optional; the secrets are listed at the top of `.github/workflows/release.yml`.
 
+The desktop app updates itself from the latest published release: at startup it offers the new version, then downloads it, checks its signature and restarts. This needs an updater key pair (`tauri signer generate -w ~/.tauri/gancho.key`): the private key and its password go in the `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` secrets, the public key in the `TAURI_UPDATER_PUBKEY` repository variable. Without them releases build as before, with no auto-update. Local builds never check for updates.
+
 ## Try it
 
 Install Rust (<https://rustup.rs>), plug in the reader, insert the cédula, then:
