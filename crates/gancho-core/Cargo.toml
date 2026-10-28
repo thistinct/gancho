@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 cmpv2 = "0.2"
 cms = "0.2"
-der = { version = "0.7", features = ["oid", "alloc"] }
+der = { version = "0.7", features = ["oid", "alloc", "pem"] }
 lopdf = { version = "0.45", default-features = false }
 rsa = { version = "0.9", features = ["sha2"] }
 sha1 = { version = "0.10", features = ["oid"] }

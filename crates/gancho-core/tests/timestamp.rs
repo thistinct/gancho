@@ -5,9 +5,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use gancho_core::ca::issuer_chain;
+use gancho_core::cades::{DetachedOptions, sign_detached};
 use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
 use gancho_core::tsp::{TimestampAuthority, request_der, token_from_response};
-use gancho_core::verify::verify_pdf;
+use gancho_core::verify::{verify_detached, verify_pdf};
 use gancho_core::{SignError, Signer};
 use rsa::RsaPrivateKey;
 use rsa::pkcs1v15::SigningKey;
@@ -123,6 +124,25 @@ fn timestamped_signature_verifies() {
         .unwrap()
         .as_secs() as i64;
     assert!((ts.time.unwrap() - now).abs() < 120);
+}
+
+#[test]
+fn timestamped_detached_signature_verifies() {
+    let Some(mut tsa) = OpensslTsa::new("detached") else {
+        return;
+    };
+    let options = DetachedOptions {
+        chain: issuer_chain(LEAF, &[ROOT, INTERMEDIATE]),
+        ..Default::default()
+    };
+    let mut signer = SoftSigner(RsaPrivateKey::from_pkcs8_pem(LEAF_KEY).unwrap());
+    let content = b"cualquier archivo";
+    let p7s = sign_detached(content, &mut signer, &options, Some(&mut tsa)).unwrap();
+    let r = verify_detached(&p7s, Some(content), &[ROOT], &[]).unwrap();
+    assert!(r.is_valid(), "{r:?}");
+    let ts = r.timestamp.as_ref().expect("timestamp present");
+    assert_eq!(ts.integrity, Ok(()));
+    assert!(ts.trusted);
 }
 
 #[test]

@@ -1,5 +1,6 @@
-//! Gancho desktop: pick a PDF, enter the PIN, sign it with the cédula;
-//! or check the signatures in a PDF. The window is plain HTML in `ui/`;
+//! Gancho desktop: pick a file, enter the PIN, sign it with the cédula
+//! (inside the PDF for PDFs, a separate `.p7s` for anything else); or check
+//! the signatures in a PDF or a `.p7s`. The window is plain HTML in `ui/`;
 //! everything that touches the card or the file runs here.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -11,9 +12,12 @@ use gancho_card::native::{self, NativeError, NativeSigner, PinStatus};
 use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca::{self, CertificateSummary};
+use gancho_core::cades::{DetachedOptions, looks_like_pdf, sign_detached};
 use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
 use gancho_core::tsp::{HttpTsa, TimestampAuthority};
-use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
+use gancho_core::verify::{
+    SignatureReport, VerifyError, format_utc, parse_pdf_date, verify_detached, verify_pdf,
+};
 use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, UiError>;
@@ -24,6 +28,10 @@ type Result<T> = std::result::Result<T, UiError>;
 struct UiError {
     message: String,
     details: Option<String>,
+    /// Another file the window should ask for and retry with: "signature"
+    /// (the `.p7s`) or "data" (the file that was signed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    need: Option<&'static str>,
 }
 
 impl UiError {
@@ -33,6 +41,14 @@ impl UiError {
         Self {
             message: message.into(),
             details: Some(details),
+            need: None,
+        }
+    }
+
+    fn needs(need: &'static str, message: &str) -> Self {
+        Self {
+            need: Some(need),
+            ..message.into()
         }
     }
 }
@@ -42,6 +58,7 @@ impl From<String> for UiError {
         Self {
             message,
             details: None,
+            need: None,
         }
     }
 }
@@ -187,11 +204,44 @@ fn card_view(
     }
 }
 
-/// `contrato.pdf` → `contrato-firmado.pdf`, in the same folder.
+#[derive(Serialize)]
+struct Output {
+    path: PathBuf,
+    /// The input is a PDF and gets the signature inside it; otherwise the
+    /// output is a separate `.p7s` signature.
+    pdf: bool,
+}
+
+/// `contrato.pdf` → `contrato-firmado.pdf`, or for any other file
+/// `contrato.docx` → `contrato.docx.p7s`, in the same folder.
 #[tauri::command]
-fn default_output(input: PathBuf) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default().to_string_lossy();
-    input.with_file_name(format!("{stem}-firmado.pdf"))
+fn default_output(input: PathBuf) -> Output {
+    if is_pdf_file(&input) {
+        let stem = input.file_stem().unwrap_or_default().to_string_lossy();
+        Output {
+            path: input.with_file_name(format!("{stem}-firmado.pdf")),
+            pdf: true,
+        }
+    } else {
+        Output {
+            path: p7s_path(&input),
+            pdf: false,
+        }
+    }
+}
+
+fn is_pdf_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(1024);
+    std::fs::File::open(path)
+        .and_then(|f| f.take(1024).read_to_end(&mut head))
+        .is_ok_and(|_| looks_like_pdf(&head))
+}
+
+fn p7s_path(input: &Path) -> PathBuf {
+    let mut name = input.as_os_str().to_owned();
+    name.push(".p7s");
+    PathBuf::from(name)
 }
 
 #[tauri::command]
@@ -202,21 +252,35 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
             return Err("elegí otro nombre: el original no se sobrescribe".into());
         }
         let input = std::fs::read(&request.input)
-            .map_err(|e| UiError::with_details("No se pudo abrir el PDF.", e))?;
+            .map_err(|e| UiError::with_details("No se pudo abrir el archivo.", e))?;
         let _guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
         let card = native::connect(None)?;
         let mut signer = NativeSigner::new(card, &request.pin)?;
         drop(request.pin);
+        let chain = ca::issuer_chain(signer.certificate_der(), ca::BUNDLED);
+        let mut tsa = non_empty(request.tsa).map(HttpTsa);
+        let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
+
+        if !looks_like_pdf(&input) {
+            let options = DetachedOptions {
+                chain,
+                ..Default::default()
+            };
+            let p7s = sign_detached(&input, &mut signer, &options, tsa)
+                .map_err(|e| UiError::with_details("No se pudo firmar el archivo.", e))?;
+            drop(signer);
+            std::fs::write(&request.output, p7s)
+                .map_err(|e| UiError::with_details("No se pudo guardar la firma.", e))?;
+            return Ok(request.output);
+        }
 
         let options = SignOptions {
             reason: non_empty(request.reason),
             location: non_empty(request.location),
-            chain: ca::issuer_chain(signer.certificate_der(), ca::BUNDLED),
+            chain,
             appearance: request.visible.then(Appearance::default),
             ..Default::default()
         };
-        let mut tsa = non_empty(request.tsa).map(HttpTsa);
-        let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
         let signed = sign_pdf_timestamped(&input, &mut signer, &options, tsa)
             .map_err(|e| UiError::with_details("No se pudo firmar el PDF.", e))?;
         drop(signer);
@@ -234,16 +298,66 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Checks the signatures in a PDF, or a detached signature. For the
+/// latter `path` is either the `.p7s` or the signed file, and `other` the
+/// counterpart the window asked for when it could not be found next to it.
 #[tauri::command]
-async fn verify(path: PathBuf) -> Result<Vec<Check>> {
+async fn verify(path: PathBuf, other: Option<PathBuf>) -> Result<Vec<Check>> {
     blocking(move || {
-        let pdf = std::fs::read(&path)
-            .map_err(|e| UiError::with_details("No se pudo abrir el PDF.", e))?;
-        let reports = verify_pdf(&pdf, &[], &[])
-            .map_err(|e| UiError::with_details("No se pudo leer el PDF.", e))?;
-        Ok(reports.iter().map(check_view).collect())
+        let bytes = read(&path)?;
+        if other.is_none() && looks_like_pdf(&bytes) {
+            let reports = verify_pdf(&bytes, &[], &[])
+                .map_err(|e| UiError::with_details("No se pudo leer el PDF.", e))?;
+            // A PDF without signatures inside may have a `.p7s` next to it.
+            if !reports.is_empty() || !p7s_path(&path).is_file() {
+                return Ok(reports.iter().map(check_view).collect());
+            }
+        }
+
+        let (sig_path, signature, data) = if is_signature_name(&path) {
+            let data = other.or_else(|| {
+                let original = path.with_extension("");
+                original.is_file().then_some(original)
+            });
+            (path, bytes, data.as_deref().map(read).transpose()?)
+        } else {
+            let sig_path = other.unwrap_or_else(|| p7s_path(&path));
+            if !sig_path.is_file() {
+                return Err(UiError::needs(
+                    "signature",
+                    "No se encontró la firma de este archivo. Elegí el archivo .p7s.",
+                ));
+            }
+            (sig_path.clone(), read(&sig_path)?, Some(bytes))
+        };
+        let report = match verify_detached(&signature, data.as_deref(), &[], &[]) {
+            Ok(r) => r,
+            Err(VerifyError::NoContent) => {
+                return Err(UiError::needs(
+                    "data",
+                    "Elegí el archivo que se firmó con esta firma.",
+                ));
+            }
+            Err(e) => return Err(UiError::with_details("No se pudo leer la firma.", e)),
+        };
+        let mut check = check_view(&report);
+        check.field = sig_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        Ok(vec![check])
     })
     .await
+}
+
+fn read(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).map_err(|e| UiError::with_details("No se pudo abrir el archivo.", e))
+}
+
+/// `.p7s` and the other names detached CMS signatures go by.
+fn is_signature_name(path: &Path) -> bool {
+    path.extension().is_some_and(|e| {
+        ["p7s", "p7m", "p7b", "sig"].contains(&e.to_string_lossy().to_lowercase().as_str())
+    })
 }
 
 fn check_view(r: &SignatureReport) -> Check {
@@ -355,6 +469,68 @@ mod tests {
             "La cédula no responde. Sacala del lector, volvé a ponerla y tocá Actualizar."
         );
         assert!(e.details.unwrap().contains("YubiKey"));
+    }
+
+    /// A `.p7s` pair is found next to each other, and the window is asked
+    /// for whichever half is missing.
+    #[test]
+    fn finds_or_asks_for_the_other_half() {
+        use std::process::Command;
+        if Command::new("openssl").arg("version").output().is_err() {
+            eprintln!("skipping: openssl not installed");
+            return;
+        }
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../gancho-core/tests/fixtures");
+        let dir = std::env::temp_dir().join(format!("gancho-desktop-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("solo")).unwrap();
+        let data = dir.join("nota.txt");
+        std::fs::write(&data, "hola").unwrap();
+        let ok = Command::new("openssl")
+            .args([
+                "cms", "-sign", "-binary", "-outform", "DER", "-md", "sha256", "-in",
+            ])
+            .arg(&data)
+            .arg("-signer")
+            .arg(fixtures.join("chain-leaf.der"))
+            .arg("-inkey")
+            .arg(fixtures.join("chain-leaf-key.pem"))
+            .arg("-out")
+            .arg(dir.join("nota.txt.p7s"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let run = |path: PathBuf, other: Option<PathBuf>| {
+            tauri::async_runtime::block_on(verify(path, other))
+        };
+
+        for path in [data.clone(), dir.join("nota.txt.p7s")] {
+            let checks = run(path, None).unwrap();
+            assert_eq!(checks[0].field.as_deref(), Some("nota.txt.p7s"));
+            // Intact, but the test CA is not a trusted root.
+            assert!(
+                checks[0]
+                    .notes
+                    .iter()
+                    .any(|n| n.ok && n.text.contains("no fue modificado"))
+            );
+            assert!(!checks[0].valid);
+        }
+
+        std::fs::copy(&data, dir.join("solo/nota.txt")).unwrap();
+        std::fs::copy(dir.join("nota.txt.p7s"), dir.join("solo/firma.p7s")).unwrap();
+        let e = run(dir.join("solo/nota.txt"), None).err().unwrap();
+        assert_eq!(e.need, Some("signature"));
+        let e = run(dir.join("solo/firma.p7s"), None).err().unwrap();
+        assert_eq!(e.need, Some("data"));
+        let checks = run(dir.join("solo/firma.p7s"), Some(dir.join("solo/nota.txt"))).unwrap();
+        assert!(
+            checks[0]
+                .notes
+                .iter()
+                .any(|n| n.text.contains("no fue modificado"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

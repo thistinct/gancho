@@ -6,10 +6,14 @@ const { open, save } = window.__TAURI__.dialog;
 
 const $ = (id) => document.getElementById(id);
 const pdfFilter = [{ name: "PDF", extensions: ["pdf"] }];
+const p7sFilter = [{ name: "Firma", extensions: ["p7s"] }];
 const baseName = (p) => p.split(/[\\/]/).pop();
 
 let input = null;
 let output = null;
+// The input is a PDF (signed inside) rather than any other file (signed
+// into a separate .p7s).
+let inputIsPdf = true;
 let card = null;
 
 function el(tag, attrs = {}, ...children) {
@@ -75,10 +79,14 @@ function updateSignButton() {
 }
 
 async function pickInput() {
-  const path = await open({ multiple: false, filters: pdfFilter });
+  const path = await open({ multiple: false });
   if (!path) return;
   input = path;
-  output = await invoke("default_output", { input });
+  const target = await invoke("default_output", { input });
+  output = target.path;
+  inputIsPdf = target.pdf;
+  for (const node of document.querySelectorAll(".pdf-only")) node.hidden = !inputIsPdf;
+  $("detached-note").hidden = inputIsPdf;
   $("input-name").textContent = baseName(input);
   $("input-name").className = "";
   $("output-name").textContent = baseName(output);
@@ -88,7 +96,7 @@ async function pickInput() {
 }
 
 async function pickOutput() {
-  const path = await save({ defaultPath: output, filters: pdfFilter });
+  const path = await save({ defaultPath: output, filters: inputIsPdf ? pdfFilter : p7sFilter });
   if (!path) return;
   output = path;
   $("output-name").textContent = baseName(output);
@@ -112,7 +120,7 @@ async function sign(event) {
         pin,
         reason: $("reason").value,
         location: $("location").value,
-        visible: $("visible").checked,
+        visible: inputIsPdf && $("visible").checked,
         tsa: $("use-tsa").checked ? $("tsa").value : null,
       },
     });
@@ -127,15 +135,32 @@ async function sign(event) {
 
 // --- Verify ---------------------------------------------------------------
 
+// A signed PDF, a .p7s, or a file with its .p7s next to it. When the
+// other half of a .p7s pair isn't next to it, Rust asks for it (`need`).
 async function pickVerify() {
-  const path = await open({ multiple: false, filters: pdfFilter });
+  const path = await open({ multiple: false });
   if (!path) return;
   $("verify-name").textContent = baseName(path);
   $("verify-name").className = "";
   const out = $("verify-result");
   out.replaceChildren(el("p", { className: "muted", textContent: "Verificando…" }));
   try {
-    const checks = await invoke("verify", { path });
+    let checks;
+    try {
+      checks = await invoke("verify", { path, other: null });
+    } catch (e) {
+      if (!e?.need) throw e;
+      out.replaceChildren(el("p", { className: "muted", textContent: e.message }));
+      const other = await open({
+        multiple: false,
+        title: e.message,
+        filters: e.need === "signature" ? p7sFilter : undefined,
+      });
+      if (!other) return;
+      $("verify-name").textContent = `${baseName(path)} + ${baseName(other)}`;
+      out.replaceChildren(el("p", { className: "muted", textContent: "Verificando…" }));
+      checks = await invoke("verify", { path, other });
+    }
     if (checks.length === 0) {
       out.replaceChildren(el("p", { className: "bad", textContent: "Este PDF no tiene firmas." }));
       return;
