@@ -29,6 +29,9 @@ struct MockCard {
     pending: Vec<u8>,
     /// Every VERIFY that carried a PIN.
     pin_attempts: usize,
+    /// Drop the verified PIN after each signature, as cards with a
+    /// "PIN for every signature" policy do.
+    pin_per_signature: bool,
 }
 
 impl MockCard {
@@ -46,6 +49,7 @@ impl MockCard {
             digest: None,
             pending: Vec::new(),
             pin_attempts: 0,
+            pin_per_signature: false,
         }
     }
 
@@ -149,6 +153,9 @@ impl Transport for MockCard {
                 }
                 assert!(self.dst_set);
                 let digest = self.digest.take().expect("PSO:HASH before PSO:CDS");
+                if self.pin_per_signature {
+                    self.verified = false;
+                }
                 let sig = self
                     .key
                     .sign(Pkcs1v15Sign::new::<Sha256>(), &digest)
@@ -187,6 +194,18 @@ fn signs_and_signature_verifies() {
     // One VERIFY covers several signatures.
     let sig2 = signer.sign_sha256_rsa(b"chau").unwrap();
     verify(signer.certificate_der(), b"chau", &sig2);
+}
+
+#[test]
+fn reverifies_pin_when_the_card_asks_again() {
+    let mut mock = MockCard::new(3);
+    mock.pin_per_signature = true;
+    let card = Card::new(mock).unwrap();
+    let mut signer = NativeSigner::new(card, "1234").unwrap();
+    for msg in [&b"uno"[..], b"dos", b"tres"] {
+        let sig = signer.sign_sha256_rsa(msg).unwrap();
+        verify(signer.certificate_der(), msg, &sig);
+    }
 }
 
 #[test]

@@ -9,7 +9,8 @@ use gancho_card::pkcs11::Module;
 use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca;
-use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
+use gancho_core::cms::CmsError;
+use gancho_core::pdf::{PdfError, SignOptions, sign_pdf_timestamped};
 use gancho_core::tsp::{HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
@@ -54,7 +55,8 @@ enum Command {
     Certs,
     /// Ask for the PIN, sign a test message on the card and verify it.
     SelfTest,
-    /// Sign a PDF with the card (PAdES-B-B, as Adobe Reader expects).
+    /// Sign one or more PDFs with the card (PAdES-B-B, as Adobe Reader
+    /// expects). Several files take a single PIN entry.
     Sign(SignArgs),
     /// Check the signatures in a PDF (no card needed).
     Verify(VerifyArgs),
@@ -72,12 +74,17 @@ struct VerifyArgs {
 
 #[derive(clap::Args)]
 struct SignArgs {
-    /// PDF to sign.
-    input: PathBuf,
-    /// Where to write the signed PDF (default: `<name>-firmado.pdf` next
-    /// to the input).
-    #[arg(short, long)]
+    /// PDFs to sign.
+    #[arg(required = true, value_name = "INPUT")]
+    inputs: Vec<PathBuf>,
+    /// Where to write the signed PDF, when signing a single file (default:
+    /// `<name>-firmado.pdf` next to the input).
+    #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
+    /// Folder for the signed PDFs (default: next to each input). Each is
+    /// named `<name>-firmado.pdf`.
+    #[arg(long, value_name = "DIR")]
+    output_dir: Option<PathBuf>,
     /// Reason shown by PDF readers, e.g. "Conformidad".
     #[arg(long)]
     reason: Option<String>,
@@ -160,10 +167,10 @@ fn run_native(command: Command, reader: Option<&str>) -> Result<()> {
         }
         Command::SelfTest => self_test(&mut native_signer(reader)?)?,
         Command::Sign(args) => {
-            // Read the PDF before asking for the PIN so a typo in the path
+            // Read the PDFs before asking for the PIN so a typo in a path
             // doesn't cost a PIN entry.
-            let input = read_pdf(&args.input)?;
-            sign_file(&mut native_signer(reader)?, &args, &input)?;
+            let jobs = sign_jobs(&args)?;
+            sign_files(&mut native_signer(reader)?, &args, jobs)?;
         }
         Command::Verify(_) => unreachable!("handled before connecting"),
     }
@@ -203,11 +210,11 @@ fn run_pkcs11(command: Command, module_path: Option<PathBuf>) -> Result<()> {
             self_test(&mut signer)?;
         }
         Command::Sign(args) => {
-            let input = read_pdf(&args.input)?;
+            let jobs = sign_jobs(&args)?;
             let slot = module.first_token()?;
             let pin = rpassword::prompt_password("PIN: ")?;
             let mut signer = module.signer(slot, pin.into())?;
-            sign_file(&mut signer, &args, &input)?;
+            sign_files(&mut signer, &args, jobs)?;
         }
         Command::Verify(_) => unreachable!("handled before loading the module"),
     }
@@ -230,11 +237,50 @@ fn read_pdf(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path).with_context(|| format!("reading {}", path.display()))
 }
 
-fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<()> {
-    let output = match &args.output {
-        Some(p) => p.clone(),
-        None => default_output(&args.input),
-    };
+/// A PDF to sign: where it comes from, its contents and where the signed
+/// copy goes.
+struct SignJob {
+    input: PathBuf,
+    pdf: Vec<u8>,
+    output: PathBuf,
+}
+
+/// Reads every input and works out every output, so that bad paths are
+/// reported before the PIN is asked for.
+fn sign_jobs(args: &SignArgs) -> Result<Vec<SignJob>> {
+    if args.output.is_some() && args.inputs.len() > 1 {
+        bail!("--output takes a single input; use --output-dir to sign several files");
+    }
+    let mut jobs: Vec<SignJob> = Vec::with_capacity(args.inputs.len());
+    for input in &args.inputs {
+        let output = match (&args.output, &args.output_dir) {
+            (Some(p), _) => p.clone(),
+            (None, Some(dir)) => dir.join(default_output(input).file_name().unwrap_or_default()),
+            (None, None) => default_output(input),
+        };
+        if same_file(input, &output) {
+            bail!("{} would overwrite its own input", output.display());
+        }
+        if let Some(other) = jobs.iter().find(|j| same_file(&j.output, &output)) {
+            bail!(
+                "{} and {} would both be written to {}",
+                other.input.display(),
+                input.display(),
+                output.display()
+            );
+        }
+        jobs.push(SignJob {
+            input: input.clone(),
+            pdf: read_pdf(input)?,
+            output,
+        });
+    }
+    Ok(jobs)
+}
+
+/// Signs each job with the same signer (one PIN entry). A file that fails
+/// doesn't stop the others; the card failing does.
+fn sign_files(signer: &mut dyn Signer, args: &SignArgs, jobs: Vec<SignJob>) -> Result<()> {
     let extra = read_certificates(&args.cas)?;
     let mut pool: Vec<&[u8]> = ca::BUNDLED.to_vec();
     pool.extend(extra.iter().map(Vec::as_slice));
@@ -257,12 +303,45 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         ..Default::default()
     };
     let mut tsa = args.tsa.clone().map(HttpTsa);
-    let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
-    let signed = sign_pdf_timestamped(input, signer, &options, tsa)
-        .with_context(|| format!("signing {}", args.input.display()))?;
-    std::fs::write(&output, signed).with_context(|| format!("writing {}", output.display()))?;
-    println!("signed: {}", output.display());
+    let total = jobs.len();
+    let mut failed = 0;
+    for job in jobs {
+        let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
+        let result = sign_pdf_timestamped(&job.pdf, signer, &options, tsa)
+            .with_context(|| format!("signing {}", job.input.display()))
+            .and_then(|signed| {
+                std::fs::write(&job.output, signed)
+                    .with_context(|| format!("writing {}", job.output.display()))
+            });
+        match result {
+            Ok(()) => println!("signed: {}", job.output.display()),
+            // A card, PIN or timestamp server problem would fail every
+            // remaining file too.
+            Err(e) if fails_every_file(&e) || total == 1 => return Err(e),
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {total} files could not be signed");
+    }
     Ok(())
+}
+
+fn fails_every_file(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<PdfError>(),
+        Some(PdfError::Cms(CmsError::Sign(_) | CmsError::Timestamp(_)))
+    )
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 fn verify(args: &VerifyArgs) -> Result<()> {

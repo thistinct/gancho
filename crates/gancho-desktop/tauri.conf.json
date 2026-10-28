@@ -32,6 +32,25 @@
       "icons/icon.icns",
       "icons/icon.ico",
       "icons/icon.png"
-    ]
+    ],
+    "fileAssociations": [
+      {
+        "ext": ["pdf"],
+        "contentTypes": ["com.adobe.pdf"],
+        "name": "PDF",
+        "description": "Documento PDF",
+        "mimeType": "application/pdf",
+        "role": "Viewer",
+        "rank": "Alternate"
+      }
+    ],
+    "linux": {
+      "deb": {
+        "desktopTemplate": "gancho.desktop"
+      },
+      "rpm": {
+        "desktopTemplate": "gancho.desktop"
+      }
+    }
   }
 }

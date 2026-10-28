@@ -33,13 +33,15 @@
 
   <form id="sign" class="panel" autocomplete="off">
     <div class="row">
-      <button type="button" id="pick-input">Elegir PDF…</button>
-      <span id="input-name" class="muted">Ningún archivo elegido</span>
+      <button type="button" id="pick-input">Elegir PDFs…</button>
+      <span id="input-hint" class="muted">o arrastralos a esta ventana</span>
     </div>
+    <ul id="file-list" class="files" hidden></ul>
     <div class="row" id="output-row" hidden>
-      <span class="muted">Se guarda como</span>
+      <span class="muted" id="output-label">Se guarda como</span>
       <span id="output-name"></span>
       <button type="button" class="link" id="pick-output">Cambiar…</button>
+      <button type="button" class="link" id="reset-output" hidden>Junto a los originales</button>
     </div>
 
     <label>Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
@@ -50,15 +52,17 @@
 
     <label>PIN <input id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required></label>
     <button type="submit" class="primary" id="sign-button" disabled>Firmar</button>
-    <p id="sign-result" role="status"></p>
+    <div id="sign-result" role="status"></div>
   </form>
 
   <section id="verify" class="panel" hidden>
     <div class="row">
       <button type="button" id="pick-verify">Elegir PDF firmado…</button>
-      <span id="verify-name" class="muted">No necesita la cédula</span>
+      <span id="verify-name" class="muted">o arrastralo acá. No necesita la cédula</span>
     </div>
     <div id="verify-result" role="status"></div>
   </section>
+
+  <div id="drop-overlay" hidden><p id="drop-text"></p></div>
 </body>
 </html>

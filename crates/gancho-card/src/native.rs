@@ -10,6 +10,7 @@ use std::ffi::{CStr, CString};
 
 use gancho_core::{SignError, Signer};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 /// IAS application AID; the file system is only reachable after selecting it.
 const IAS_AID: [u8; 12] = [
@@ -579,9 +580,16 @@ fn connect_reader(ctx: &pcsc::Context, name: &CStr) -> Result<Card<PcscTransport
 }
 
 /// [`Signer`] backed by a card whose PIN has been verified.
+///
+/// One PIN entry covers any number of signatures: the cédula keeps the PIN
+/// verified for the rest of the card session. Should a card drop it after a
+/// signature anyway ("security status not satisfied"), the signer verifies
+/// the same PIN again and retries once, so signing a batch of files still
+/// takes a single PIN entry.
 pub struct NativeSigner<T: Transport> {
     card: Card<T>,
     certificate: Vec<u8>,
+    pin: Zeroizing<String>,
 }
 
 impl<T: Transport> NativeSigner<T> {
@@ -589,7 +597,21 @@ impl<T: Transport> NativeSigner<T> {
     pub fn new(mut card: Card<T>, pin: &str) -> Result<Self, NativeError> {
         let certificate = card.certificate()?;
         card.verify_pin(pin)?;
-        Ok(Self { card, certificate })
+        Ok(Self {
+            card,
+            certificate,
+            pin: Zeroizing::new(pin.to_owned()),
+        })
+    }
+
+    fn sign_digest(&mut self, digest: &[u8; 32]) -> Result<Vec<u8>, NativeError> {
+        match self.card.sign_sha256_digest(digest) {
+            Err(NativeError::Status { sw: 0x6982, .. }) => {
+                self.card.verify_pin(&self.pin)?;
+                self.card.sign_sha256_digest(digest)
+            }
+            other => other,
+        }
     }
 }
 
@@ -600,7 +622,7 @@ impl<T: Transport> Signer for NativeSigner<T> {
 
     fn sign_sha256_rsa(&mut self, data: &[u8]) -> Result<Vec<u8>, SignError> {
         let digest: [u8; 32] = Sha256::digest(data).into();
-        self.card.sign_sha256_digest(&digest).map_err(|e| match e {
+        self.sign_digest(&digest).map_err(|e| match e {
             NativeError::WrongPin(_) => SignError::WrongPin(e.to_string()),
             NativeError::PinBlocked => SignError::PinBlocked,
             e => SignError::Device(e.to_string()),
