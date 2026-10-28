@@ -1,0 +1,25 @@
+[ca]
+default_ca = ca
+[ca]
+database = ./ca-index.txt
+crlnumber = ./crlnumber
+default_md = sha256
+default_crl_days = 36500
+[root_ext]
+basicConstraints = critical, CA:true
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+[ca_ext]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+crlDistributionPoints = URI:http://pki.test/root.crl
+[leaf_ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, nonRepudiation
+crlDistributionPoints = URI:http://pki.test/ca.crl
+authorityInfoAccess = OCSP;URI:http://ocsp.pki.test/
+[crl_only_ext]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, nonRepudiation
+crlDistributionPoints = URI:http://pki.test/ca.crl

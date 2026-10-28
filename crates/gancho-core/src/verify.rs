@@ -5,7 +5,10 @@
 //! signature verifies with the signer's certificate), whether later
 //! revisions were appended after it, whether the signer's certificate
 //! chains up to a trusted root, and any RFC 3161 signature timestamp.
-//! Revocation (CRL/OCSP) is not checked yet.
+//! With several signatures, the revisions appended after each one are
+//! checked to only add signatures and validation data. Revocation is
+//! checked against the data stored in the PDF (its DSS) for long-term
+//! validation; nothing is fetched from the network.
 
 use cms::cert::CertificateChoices;
 use cms::content_info::ContentInfo;
@@ -18,6 +21,9 @@ use x509_tsp::TstInfo;
 
 use crate::ber;
 use crate::ca::{self, Hash};
+use crate::changes;
+use crate::ltv::{ValidationData, read_dss};
+use crate::revocation::{self, Finding, Status};
 
 const ID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 const ID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
@@ -64,7 +70,8 @@ pub struct TimestampReport {
 }
 
 impl TimestampReport {
-    fn trusted_time(&self) -> Option<i64> {
+    /// The time, when the token is intact and its authority trusted.
+    pub fn trusted_time(&self) -> Option<i64> {
         (self.integrity.is_ok() && self.trusted)
             .then_some(self.time)
             .flatten()
@@ -98,15 +105,47 @@ pub struct SignatureReport {
     /// (`None` when neither is available).
     pub valid_at_signing_time: Option<bool>,
     pub timestamp: Option<TimestampReport>,
+    /// Revocation status from the PDF's validation data for the signer's
+    /// certificate and each CA above it (not the root), signer first.
+    pub revocation: Vec<RevocationReport>,
+    /// A certificate on the path was revoked before the signature was
+    /// made (or, without a trusted timestamp, at all).
+    pub revoked: bool,
+    /// What later revisions changed beyond adding signatures and
+    /// validation data; empty when nothing else changed.
+    pub changes_after: Vec<String>,
+}
+
+/// What the stored validation data says about one certificate.
+#[derive(Debug, Clone)]
+pub struct RevocationReport {
+    pub subject: String,
+    /// `None` when the PDF holds nothing about this certificate.
+    pub finding: Option<Finding>,
 }
 
 impl SignatureReport {
-    /// Intact, trusted and in date, with an intact timestamp if it has one.
+    /// Intact, trusted, in date and not revoked, with an intact timestamp
+    /// if it has one, and no changes after it other than signatures.
     pub fn is_valid(&self) -> bool {
         self.integrity.is_ok()
             && self.trusted
             && self.valid_at_signing_time != Some(false)
             && self.timestamp.as_ref().is_none_or(|t| t.integrity.is_ok())
+            && !self.revoked
+            && self.changes_after.is_empty()
+    }
+
+    /// The PDF carries revocation data showing every certificate on the
+    /// path was good, so the signature can be checked long-term.
+    pub fn long_term(&self) -> bool {
+        self.integrity.is_ok()
+            && self.trusted
+            && !self.revocation.is_empty()
+            && self
+                .revocation
+                .iter()
+                .all(|r| r.finding.is_some_and(|f| f.status == Status::Good))
     }
 }
 
@@ -123,10 +162,12 @@ pub fn verify_pdf(
 ) -> Result<Vec<SignatureReport>, VerifyError> {
     let doc = Document::load_mem(pdf).map_err(VerifyError::Parse)?;
     let names = field_names(&doc);
+    let dss = read_dss(&doc);
     let mut anchors: Vec<&[u8]> = anchors.to_vec();
     anchors.extend(ca::bundled_roots());
     let mut intermediates: Vec<&[u8]> = intermediates.to_vec();
     intermediates.extend(ca::BUNDLED);
+    intermediates.extend(dss.certs.iter().map(Vec::as_slice));
     let trust = Trust {
         anchors: &anchors,
         intermediates: &intermediates,
@@ -145,19 +186,86 @@ pub fn verify_pdf(
         intermediates: &intermediates,
     };
 
+    let ctx = Context {
+        pdf,
+        doc: &doc,
+        dss: &dss,
+        trust,
+        tsa_trust,
+    };
+    Ok(signature_dicts(&doc)
+        .into_iter()
+        .map(|(id, d)| check_one(&ctx, d, names.get(&id).cloned()))
+        .collect())
+}
+
+/// Signature dictionaries in the order they were made (by where their
+/// signed range ends).
+fn signature_dicts(doc: &Document) -> Vec<(ObjectId, &Dictionary)> {
     let mut sigs: Vec<(ObjectId, &Dictionary)> = doc
         .objects
         .iter()
         .filter_map(|(id, obj)| Some((*id, obj.as_dict().ok()?)))
         .filter(|(_, d)| d.has(b"ByteRange") && d.has(b"Contents"))
         .collect();
-    // Order by where the signed range ends, i.e. the order they were made.
     sigs.sort_by_key(|(_, d)| byte_range(d).map(|r| r[2] + r[3]).unwrap_or(0));
+    sigs
+}
 
-    Ok(sigs
+/// The certificates behind one signature, for collecting validation data.
+pub(crate) struct SignatureCertificates {
+    pub signer: Vec<u8>,
+    /// Every certificate the signature carries.
+    pub carried: Vec<Vec<u8>>,
+    /// The timestamp authority's certificate and those its token carries.
+    pub timestamp: Option<(Vec<u8>, Vec<Vec<u8>>)>,
+}
+
+/// The certificates of every signature in `pdf` that can be read, without
+/// checking the signatures.
+pub(crate) fn signature_certificates(pdf: &[u8]) -> Vec<SignatureCertificates> {
+    let Ok(doc) = Document::load_mem(pdf) else {
+        return Vec::new();
+    };
+    signature_dicts(&doc)
         .into_iter()
-        .map(|(id, d)| check_one(pdf, d, names.get(&id).cloned(), &trust, &tsa_trust))
-        .collect())
+        .filter_map(|(_, d)| {
+            let sd = parse_signed_data(d.get(b"Contents").ok()?.as_str().ok()?).ok()?;
+            let (signer, carried) = signer_certificate(&sd)?;
+            let timestamp = timestamp_token(sd.signer_infos.0.iter().next()?)
+                .and_then(|t| parse_signed_data(&t).ok())
+                .and_then(|t| signer_certificate(&t));
+            Some(SignatureCertificates {
+                signer,
+                carried,
+                timestamp,
+            })
+        })
+        .collect()
+}
+
+/// The first signer's certificate in `sd` and all the certificates it
+/// carries, DER.
+fn signer_certificate(sd: &SignedData) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let si = sd.signer_infos.0.iter().next()?;
+    let certs = carried_certificates(sd);
+    let signer = certs
+        .iter()
+        .find(|c| identifies(&si.sid, c))?
+        .to_der()
+        .ok()?;
+    Some((
+        signer,
+        certs.iter().filter_map(|c| c.to_der().ok()).collect(),
+    ))
+}
+
+struct Context<'a> {
+    pdf: &'a [u8],
+    doc: &'a Document,
+    dss: &'a ValidationData,
+    trust: Trust<'a>,
+    tsa_trust: Trust<'a>,
 }
 
 struct Trust<'a> {
@@ -184,13 +292,8 @@ impl Trust<'_> {
     }
 }
 
-fn check_one(
-    pdf: &[u8],
-    sig: &Dictionary,
-    field: Option<String>,
-    trust: &Trust,
-    tsa_trust: &Trust,
-) -> SignatureReport {
+fn check_one(ctx: &Context, sig: &Dictionary, field: Option<String>) -> SignatureReport {
+    let pdf = ctx.pdf;
     let string = |key: &[u8]| {
         sig.get(key)
             .ok()
@@ -215,6 +318,9 @@ fn check_one(
         trusted: false,
         valid_at_signing_time: None,
         timestamp: None,
+        revocation: Vec::new(),
+        revoked: false,
+        changes_after: Vec::new(),
     };
 
     let Some(range) = byte_range(sig) else {
@@ -227,6 +333,18 @@ fn check_one(
         return report;
     }
     report.covers_whole_file = pdf[c + d..].iter().all(u8::is_ascii_whitespace);
+    if !report.covers_whole_file {
+        report.changes_after = match Document::load_mem(&pdf[..c + d]) {
+            Ok(signed) => changes::after(&signed, ctx.doc),
+            Err(_) => vec!["the signed revision cannot be read on its own".into()],
+        };
+        if changes::docmdp_permissions(ctx.doc, sig) == Some(1) {
+            report.changes_after.insert(
+                0,
+                "the document was certified with no changes allowed, yet it was changed".into(),
+            );
+        }
+    }
 
     let Ok(contents) = sig.get(b"Contents").and_then(Object::as_str) else {
         report.integrity = Err(IntegrityError::ByteRange);
@@ -243,34 +361,41 @@ fn check_one(
     };
 
     report.signer = Some(checked.signer.tbs_certificate.subject.to_string());
-    let (path, trusted) = trust.path(&checked.signer, &checked.certs);
+    let (path, trusted) = ctx.trust.path(&checked.signer, &checked.certs);
     report.trusted = trusted;
     report.chain = path[1..]
         .iter()
         .map(|c| c.tbs_certificate.subject.to_string())
         .collect();
-    report.timestamp = signature_timestamp(&checked.signer_info, tsa_trust);
-    let time = report
+    report.timestamp = signature_timestamp(&checked.signer_info, &ctx.tsa_trust);
+    let proven_time = report
         .timestamp
         .as_ref()
-        .and_then(TimestampReport::trusted_time)
-        .or_else(|| signed_at.as_deref().and_then(parse_pdf_date));
+        .and_then(TimestampReport::trusted_time);
+    let time = proven_time.or_else(|| signed_at.as_deref().and_then(parse_pdf_date));
     report.valid_at_signing_time = time.map(|t| path.iter().all(|c| valid_at(c, t)));
+    report.revocation = path
+        .windows(2)
+        .map(|pair| RevocationReport {
+            subject: pair[0].tbs_certificate.subject.to_string(),
+            finding: revocation::check(&pair[0], &pair[1], &ctx.dss.ocsps, &ctx.dss.crls),
+        })
+        .collect();
+    // Without a trusted timestamp the claimed time proves nothing, so any
+    // revocation counts.
+    report.revoked = report.revocation.iter().any(|r| match r.finding {
+        Some(Finding {
+            status: Status::Revoked(at),
+            ..
+        }) => proven_time.is_none_or(|t| at <= t),
+        _ => false,
+    });
     report
 }
 
 /// Checks the `signature-time-stamp` unsigned attribute, if present.
 fn signature_timestamp(si: &SignerInfo, trust: &Trust) -> Option<TimestampReport> {
-    let token = si
-        .unsigned_attrs
-        .as_ref()?
-        .iter()
-        .find(|a| a.oid.to_string() == ID_SIGNATURE_TIME_STAMP_TOKEN)?
-        .values
-        .iter()
-        .next()?
-        .to_der()
-        .ok()?;
+    let token = timestamp_token(si)?;
     let mut report = TimestampReport {
         time: None,
         tsa: None,
@@ -304,6 +429,40 @@ fn signature_timestamp(si: &SignerInfo, trust: &Trust) -> Option<TimestampReport
     Some(report)
 }
 
+/// The DER of the `signature-time-stamp` unsigned attribute's token.
+fn timestamp_token(si: &SignerInfo) -> Option<Vec<u8>> {
+    si.unsigned_attrs
+        .as_ref()?
+        .iter()
+        .find(|a| a.oid.to_string() == ID_SIGNATURE_TIME_STAMP_TOKEN)?
+        .values
+        .iter()
+        .next()?
+        .to_der()
+        .ok()
+}
+
+fn carried_certificates(sd: &SignedData) -> Vec<Certificate> {
+    sd.certificates
+        .iter()
+        .flat_map(|set| set.0.iter())
+        .filter_map(|c| match c {
+            CertificateChoices::Certificate(c) => Some(c.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn identifies(sid: &SignerIdentifier, c: &Certificate) -> bool {
+    match sid {
+        SignerIdentifier::IssuerAndSerialNumber(ias) => {
+            c.tbs_certificate.issuer == ias.issuer
+                && c.tbs_certificate.serial_number == ias.serial_number
+        }
+        SignerIdentifier::SubjectKeyIdentifier(_) => false,
+    }
+}
+
 fn parse_signed_data(der: &[u8]) -> Result<SignedData, IntegrityError> {
     let cms_err = |e: der::Error| IntegrityError::Cms(e.to_string());
     let der = ber::to_der(der).ok_or(IntegrityError::Cms("malformed encoding".into()))?;
@@ -334,24 +493,10 @@ fn check_signed_data(sd: &SignedData, content: &[&[u8]]) -> Result<Checked, Inte
     let digest_alg = si.digest_alg.oid.to_string();
     let hash = Hash::from_digest_oid(&digest_alg).ok_or(IntegrityError::Algorithm(digest_alg))?;
 
-    let certs: Vec<Certificate> = sd
-        .certificates
-        .iter()
-        .flat_map(|set| set.0.iter())
-        .filter_map(|c| match c {
-            CertificateChoices::Certificate(c) => Some(c.clone()),
-            _ => None,
-        })
-        .collect();
+    let certs = carried_certificates(sd);
     let signer = certs
         .iter()
-        .find(|c| match &si.sid {
-            SignerIdentifier::IssuerAndSerialNumber(ias) => {
-                c.tbs_certificate.issuer == ias.issuer
-                    && c.tbs_certificate.serial_number == ias.serial_number
-            }
-            SignerIdentifier::SubjectKeyIdentifier(_) => false,
-        })
+        .find(|c| identifies(&si.sid, c))
         .ok_or(IntegrityError::SignerCertificate)?
         .clone();
 

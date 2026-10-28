@@ -6,8 +6,11 @@
 pub mod appearance;
 mod ber;
 pub mod ca;
+mod changes;
 pub mod cms;
+pub mod ltv;
 pub mod pdf;
+pub mod revocation;
 pub mod tsp;
 pub mod verify;
 
