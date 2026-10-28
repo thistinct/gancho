@@ -1,10 +1,9 @@
 # Builds the desktop app installers and the `gancho` command-line binaries
 # for macOS, Windows and Linux.
 #
-# - Pushing a tag `vX.Y.Z` builds everything and attaches it to a *draft*
-#   GitHub Release named after the tag; publish it by hand once checked.
-# - A pull request that touches this file, or running the workflow by hand
-#   (Actions tab), builds everything and keeps the files as run artifacts.
+# It runs only when a version tag `vX.Y.Z` is pushed, never on pull requests
+# or branch pushes. It builds everything and attaches it to a *draft*
+# GitHub Release named after the tag; publish it by hand once checked.
 #
 # Signing is optional. Without the secrets below the builds still succeed:
 # macOS gets an ad-hoc signature (users must right-click > Open the first
@@ -22,10 +21,7 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
-  pull_request:
-    paths: [".github/workflows/release.yml"]
-  workflow_dispatch:
+    tags: ["v[0-9]*"]
 
 permissions:
   contents: write
@@ -49,22 +45,17 @@ jobs:
           app=$(jq -r .version crates/gancho-desktop/tauri.conf.json)
           cli=$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "gancho") | .version')
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            want=${GITHUB_REF_NAME#v}
-            for v in "$app" "$cli"; do
-              if [ "$v" != "$want" ]; then
-                echo "::error::Tag $GITHUB_REF_NAME does not match version $v in tauri.conf.json / gancho-cli/Cargo.toml"
-                exit 1
-              fi
-            done
-            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-            echo "label=$want" >> "$GITHUB_OUTPUT"
-          else
-            echo "label=$app-dev.${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-          fi
+          want=${GITHUB_REF_NAME#v}
+          for v in "$app" "$cli"; do
+            if [ "$v" != "$want" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version $v in tauri.conf.json / gancho-cli/Cargo.toml"
+              exit 1
+            fi
+          done
+          echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          echo "label=$want" >> "$GITHUB_OUTPUT"
 
       - name: Create draft release
-        if: steps.version.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -272,7 +263,6 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to the release
-        if: env.TAG != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" dist/* --clobber
@@ -283,7 +273,6 @@ jobs:
 
   checksums:
     needs: [prepare, build]
-    if: needs.prepare.outputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
