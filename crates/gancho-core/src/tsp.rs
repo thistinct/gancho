@@ -22,6 +22,9 @@ use x509_tsp::{MessageImprint, TimeStampReq, TimeStampResp, TspVersion, TstInfo}
 const ID_SHA256: der::oid::ObjectIdentifier =
     der::oid::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1");
 
+/// A free public timestamp server, used when none is named.
+pub const DEFAULT_TSA_URL: &str = "http://timestamp.digicert.com";
+
 /// Something that can deliver a DER `TimeStampReq` to a TSA and return its
 /// DER `TimeStampResp`, typically an HTTP POST with content type
 /// `application/timestamp-query`.

@@ -33,15 +33,21 @@ cargo run -p gancho -- self-test   # asks for the PIN, signs a test message, ver
 cargo run -p gancho -- sign samples/ejemplo.pdf   # writes samples/ejemplo-firmado.pdf
 ```
 
-`sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. Signing an already signed PDF adds a second signature and keeps the first one valid. The issuing CA certificates are embedded so readers can connect the signer to the national root.
+`sign` also takes `-o OUT.pdf`, `--reason "Conformidad"` and `--location "Montevideo"`. The issuing CA certificates are embedded so readers can connect the signer to the national root.
 
-Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it). Add `--tsa URL` to have a timestamp server certify the signing time (PAdES-B-T), so the signature stays verifiable after the certificate expires, e.g. `--tsa http://timestamp.digicert.com`.
+Add `--visible` for a signature box with your name and the date (bottom-left of the last page; `--page N` and `--rect x1,y1,x2,y2` in points move it).
+
+**Signing time.** `--time local` (the default) records this computer's clock; verifiers show it as the time the signer claims. `--time tsa` has a timestamp server certify it instead (PAdES-B-T, needs internet); it uses `http://timestamp.digicert.com` unless `--tsa URL` names another (`--tsa` alone implies `--time tsa`).
+
+**Long-term validity** (optional). `--lt` stores the certificates and their revocation status (an OCSP answer, or the CA's CRL) in the PDF's Document Security Store, so the signature can still be checked after the certificate expires and the CA stops answering for it (PAdES-B-LT together with `--time tsa`). The status of your own certificate is fetched before the card signs: if it is revoked, or the CA cannot be reached, nothing is signed. `gancho ltv FILE.pdf` adds the same data later to a PDF that is already signed, for every signature in it.
+
+**Several signers.** Signing an already signed PDF adds another signature in an incremental update and keeps the earlier ones valid; each signer can choose `--lt` independently. A PDF certified by its author with "no changes allowed" is refused.
 
 ```sh
 cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 ```
 
-`verify` checks each signature's integrity, whether the document was extended after it, the certificate path up to AC Raíz Nacional, and the certificate dates at the signing time, and any timestamp. Revocation is not checked yet. Both commands take `--ca FILE` (DER or PEM, repeatable) for extra CA certificates; a self-signed one passed to `verify` is trusted as a root.
+`verify` lists every signature, oldest first, and checks each one's integrity, that whatever was added after it is only further signatures and validation data (new page content or a changed annotation fails it), the certificate path up to AC Raíz Nacional, the certificate dates at the signing time, any timestamp, and revocation against the data stored in the PDF (it fetches nothing; a revocation after a certified timestamp does not invalidate the signature). Both commands take `--ca FILE` (DER or PEM, repeatable) for extra CA certificates; a self-signed one passed to `verify` is trusted as a root.
 
 ### Desktop app
 
@@ -49,7 +55,7 @@ cargo run -p gancho -- verify samples/ejemplo-firmado.pdf   # no card needed
 cargo run -p gancho-desktop
 ```
 
-It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box and timestamp optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
+It shows the cédula's holder, validity and PIN tries; signs a chosen PDF (reason, location, visible box optional; the time from the computer's clock or a timestamp server; long-term validity optional) next to the original as `-firmado.pdf`; and verifies signed PDFs. macOS and Windows need nothing extra; Linux also needs `libwebkit2gtk-4.1-dev`. `cargo install tauri-cli` then `cargo tauri build` in `crates/gancho-desktop` makes an installable `.app`/`.dmg`.
 
 On Linux, also install `pcscd` and the headers (`libpcsclite-dev` on Debian/Ubuntu).
 
@@ -60,7 +66,7 @@ To use a PKCS#11 driver instead, add `--backend pkcs11` (optionally with `--modu
 1. **Card access** (done): `devices`, `certs`, `self-test`, directly or via PKCS#11.
 2. **PDF signing, PAdES-B-B** (done): `sign`. Incremental update with a signature field, `/ByteRange` placeholder, `/SubFilter /ETSI.CAdES.detached`; detached CMS SignedData with `contentType`, `messageDigest` and `signingCertificateV2` signed attributes (`cms`, `x509-cert`, `lopdf`).
 3. **Verification** (done): `verify`. Checks the CMS signature, the byte range, and the chain against the bundled ACRN and Ministerio del Interior CA certificates.
-4. **Timestamps** (done): `sign --tsa URL` (PAdES-B-T). **Long-term validation** next: a DSS dictionary with the chain and CRLs (PAdES-B-LT).
+4. **Timestamps** (done): `sign --time tsa` (PAdES-B-T). **Long-term validation** (done): `sign --lt`, `ltv` (DSS with certificates, OCSP and CRLs; PAdES-B-LT). Archive timestamps (B-LTA) are not done.
 5. **Visible signature** (done): `sign --visible`.
 6. **Desktop app** (done, Tauri 2): pick file, show certificate, enter PIN, sign, verify.
 7. Packaging per OS, plus CAdES `.p7s` for arbitrary files.

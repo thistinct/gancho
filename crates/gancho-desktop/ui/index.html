@@ -45,8 +45,13 @@
     <label>Motivo <input id="reason" placeholder="Conformidad (opcional)"></label>
     <label>Lugar <input id="location" placeholder="Montevideo (opcional)"></label>
     <label class="check"><input type="checkbox" id="visible" checked> Mostrar la firma en la última página</label>
-    <label class="check"><input type="checkbox" id="use-tsa"> Agregar sello de tiempo</label>
-    <label id="tsa-row" hidden>Servidor de sello de tiempo <input id="tsa" value="http://timestamp.digicert.com"></label>
+    <fieldset class="choice">
+      <legend>Hora de la firma</legend>
+      <label class="check"><input type="radio" name="time" value="local" checked> Hora de esta computadora</label>
+      <label class="check"><input type="radio" name="time" value="tsa"> Sello de tiempo de un servidor (certifica la hora, necesita internet)</label>
+      <label id="tsa-row" hidden>Servidor de sello de tiempo <input id="tsa" value="http://timestamp.digicert.com"></label>
+    </fieldset>
+    <label class="check"><input type="checkbox" id="lt"> Validez a largo plazo (guarda el estado del certificado para verificar la firma después de que venza; necesita internet)</label>
 
     <label>PIN <input id="pin" type="password" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" required></label>
     <button type="submit" class="primary" id="sign-button" disabled>Firmar</button>

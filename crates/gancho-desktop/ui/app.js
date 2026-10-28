@@ -103,9 +103,12 @@ async function sign(event) {
   $("sign-button").disabled = true;
   $("refresh").disabled = true;
   result.className = "muted";
-  result.textContent = $("use-tsa").checked ? "Firmando y pidiendo el sello de tiempo…" : "Firmando…";
+  const useTsa = timeSource() === "tsa";
+  const lt = $("lt").checked;
+  result.textContent =
+    useTsa || lt ? "Firmando y consultando por internet…" : "Firmando…";
   try {
-    const saved = await invoke("sign", {
+    const signed = await invoke("sign", {
       request: {
         input,
         output,
@@ -113,11 +116,13 @@ async function sign(event) {
         reason: $("reason").value,
         location: $("location").value,
         visible: $("visible").checked,
-        tsa: $("use-tsa").checked ? $("tsa").value : null,
+        tsa: useTsa ? $("tsa").value : null,
+        lt,
       },
     });
     result.className = "ok";
-    result.textContent = `Listo: ${saved}`;
+    result.replaceChildren(`Listo: ${signed.output}`);
+    for (const n of signed.notes) result.append(el("div", { className: "muted", textContent: n }));
   } catch (e) {
     showError(result, e, "No se pudo firmar: ");
   }
@@ -148,10 +153,10 @@ async function pickVerify() {
   }
 }
 
-function renderCheck(c, i) {
+function renderCheck(c, i, all) {
   const lines = [
     c.signer && `Firmante: ${c.signer}`,
-    c.time && `Fecha declarada: ${c.time}`,
+    c.time && `Fecha: ${c.time}`,
     c.reason && `Motivo: ${c.reason}`,
     c.location && `Lugar: ${c.location}`,
   ].filter(Boolean);
@@ -160,7 +165,7 @@ function renderCheck(c, i) {
     { className: "sig" },
     el("h3", {
       className: c.valid ? "ok" : "bad",
-      textContent: `${c.valid ? "✓ Firma válida" : "✗ Firma no válida"} (${c.field ?? `firma ${i + 1}`})`,
+      textContent: `${c.valid ? "✓ Firma válida" : "✗ Firma no válida"} (${all.length > 1 ? `${i + 1} de ${all.length}, ` : ""}${c.field ?? `firma ${i + 1}`})`,
     }),
     ...lines.map((t) => el("div", { className: "muted", textContent: t })),
     el("ul", {}, ...c.notes.map((n) => el("li", { className: n.ok ? "" : "bad", textContent: n.text }))),
@@ -184,7 +189,12 @@ $("pick-input").addEventListener("click", pickInput);
 $("pick-output").addEventListener("click", pickOutput);
 $("pick-verify").addEventListener("click", pickVerify);
 $("pin").addEventListener("input", updateSignButton);
-$("use-tsa").addEventListener("change", (e) => ($("tsa-row").hidden = !e.target.checked));
+function timeSource() {
+  return document.querySelector('input[name="time"]:checked').value;
+}
+for (const radio of document.querySelectorAll('input[name="time"]')) {
+  radio.addEventListener("change", () => ($("tsa-row").hidden = timeSource() !== "tsa"));
+}
 $("sign").addEventListener("submit", sign);
 
 refreshCard();

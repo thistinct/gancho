@@ -15,7 +15,10 @@ use sha2::{Digest, Sha256};
 
 use crate::Signer;
 use crate::appearance::{self, Appearance};
+use crate::ca;
 use crate::cms::{CmsError, signed_data_detached};
+use crate::ltv::{Collector, LtvError, add_dss};
+use crate::revocation::Fetch;
 use crate::tsp::TimestampAuthority;
 
 /// Bytes reserved for the DER signature. A cédula signature with its
@@ -44,8 +47,14 @@ pub enum PdfError {
     Placeholder,
     #[error("the signature is {0} bytes, more than the {SIGNATURE_CAPACITY} reserved")]
     TooLarge(usize),
+    #[error(
+        "the document was certified by its author with no changes allowed, so it cannot be signed again"
+    )]
+    Certified,
     #[error(transparent)]
     Cms(#[from] CmsError),
+    #[error(transparent)]
+    Ltv(#[from] LtvError),
 }
 
 /// What to record in the signature dictionary.
@@ -84,6 +93,9 @@ pub fn sign_pdf_timestamped(
     if doc.is_encrypted() {
         return Err(PdfError::Encrypted);
     }
+    if crate::changes::forbids_changes(&doc) {
+        return Err(PdfError::Certified);
+    }
     let mut inc = IncrementalDocument::create_from(input.to_vec(), doc);
     let time = options.time.unwrap_or_else(SystemTime::now);
     let cert = signer.certificate_der().to_vec();
@@ -105,6 +117,29 @@ pub fn sign_pdf_timestamped(
     let hex = hex_upper(&cms);
     out[contents_start + 1..contents_start + 1 + hex.len()].copy_from_slice(hex.as_bytes());
     Ok(out)
+}
+
+/// Like [`sign_pdf_timestamped`], and also stores long-term validation
+/// data (PAdES-B-LT when timestamped): the certificates and their current
+/// revocation status, fetched through `fetch`, for this signature and any
+/// earlier ones. The signer's own status is fetched first, and signing
+/// stops if it is revoked or cannot be checked. Returns the signed PDF and
+/// any problems with the optional data (earlier signers, the TSA).
+pub fn sign_pdf_lt(
+    input: &[u8],
+    signer: &mut dyn Signer,
+    options: &SignOptions,
+    tsa: Option<&mut dyn TimestampAuthority>,
+    fetch: &mut dyn Fetch,
+) -> Result<(Vec<u8>, Vec<String>), PdfError> {
+    let mut collector = Collector::new(fetch);
+    let mut pool: Vec<&[u8]> = options.chain.iter().map(Vec::as_slice).collect();
+    pool.extend(ca::BUNDLED);
+    collector.require(signer.certificate_der(), &pool)?;
+    let signed = sign_pdf_timestamped(input, signer, options, tsa)?;
+    collector.collect_document(&signed);
+    let (data, warnings) = collector.into_data();
+    Ok((add_dss(&signed, &data)?, warnings))
 }
 
 fn add_signature_objects(
@@ -265,12 +300,16 @@ fn add_objects(
         }
     }
 
-    // Keys describing the previous cross-reference stream must not leak into
-    // the new trailer.
+    clean_trailer(inc);
+    Ok(())
+}
+
+/// Keys describing the previous cross-reference stream must not leak into
+/// the new trailer.
+pub(crate) fn clean_trailer(inc: &mut IncrementalDocument) {
     for key in [b"Index".as_slice(), b"DecodeParms", b"XRefStm", b"Filter"] {
         inc.new_document.trailer.remove(key);
     }
-    Ok(())
 }
 
 /// The page's `/MediaBox`, which may be inherited from its parents; A4

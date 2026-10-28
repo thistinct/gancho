@@ -11,7 +11,9 @@ use gancho_card::native::{self, NativeError, NativeSigner, PinStatus};
 use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca::{self, CertificateSummary};
-use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
+use gancho_core::ltv::LtvError;
+use gancho_core::pdf::{PdfError, SignOptions, sign_pdf_lt, sign_pdf_timestamped};
+use gancho_core::revocation::{HttpFetch, Status};
 use gancho_core::tsp::{HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use serde::{Deserialize, Serialize};
@@ -116,8 +118,20 @@ struct SignRequest {
     reason: Option<String>,
     location: Option<String>,
     visible: bool,
-    /// Timestamp server URL, when wanted.
+    /// Timestamp server URL when the time should be certified by it;
+    /// otherwise the computer's clock is used.
     tsa: Option<String>,
+    /// Store revocation data for long-term validity.
+    #[serde(default)]
+    lt: bool,
+}
+
+#[derive(Serialize)]
+struct Signed {
+    output: PathBuf,
+    /// Problems with optional extras (for example the validation data of
+    /// an earlier signer), in plain Spanish.
+    notes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -195,7 +209,7 @@ fn default_output(input: PathBuf) -> PathBuf {
 }
 
 #[tauri::command]
-async fn sign(request: SignRequest) -> Result<PathBuf> {
+async fn sign(request: SignRequest) -> Result<Signed> {
     blocking(move || {
         // Checked before the PIN is used.
         if same_file(&request.input, &request.output) {
@@ -217,14 +231,54 @@ async fn sign(request: SignRequest) -> Result<PathBuf> {
         };
         let mut tsa = non_empty(request.tsa).map(HttpTsa);
         let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
-        let signed = sign_pdf_timestamped(&input, &mut signer, &options, tsa)
-            .map_err(|e| UiError::with_details("No se pudo firmar el PDF.", e))?;
+        let (signed, warnings) = if request.lt {
+            sign_pdf_lt(&input, &mut signer, &options, tsa, &mut HttpFetch)
+        } else {
+            sign_pdf_timestamped(&input, &mut signer, &options, tsa).map(|s| (s, Vec::new()))
+        }
+        .map_err(sign_error)?;
         drop(signer);
         std::fs::write(&request.output, signed)
             .map_err(|e| UiError::with_details("No se pudo guardar el PDF firmado.", e))?;
-        Ok(request.output)
+        for w in &warnings {
+            eprintln!("gancho: {w}");
+        }
+        let notes = if warnings.is_empty() {
+            Vec::new()
+        } else {
+            vec![
+                "No se pudo guardar el estado de todos los certificados (por ejemplo, el de \
+                una firma anterior o el del sello de tiempo). El de tu firma sí quedó guardado."
+                    .to_owned(),
+            ]
+        };
+        Ok(Signed {
+            output: request.output,
+            notes,
+        })
     })
     .await
+}
+
+fn sign_error(e: PdfError) -> UiError {
+    let message = match &e {
+        PdfError::Ltv(LtvError::Revoked { at, .. }) => format!(
+            "Tu certificado fue revocado el {}. No se puede usar para firmar.",
+            &format_utc(*at)[..10]
+        ),
+        PdfError::Ltv(_) => "No se pudo consultar si tu certificado está vigente. Revisá la \
+            conexión a internet y probá de nuevo, o firmá sin validez a largo plazo."
+            .to_owned(),
+        PdfError::Cms(gancho_core::cms::CmsError::Timestamp(_)) => "No se pudo obtener el \
+            sello de tiempo. Revisá la conexión a internet y probá de nuevo, o usá la hora de \
+            esta computadora."
+            .to_owned(),
+        PdfError::Certified => "El autor certificó este PDF sin permitir cambios, así que no se \
+            puede firmar de nuevo."
+            .to_owned(),
+        _ => "No se pudo firmar el PDF.".to_owned(),
+    };
+    UiError::with_details(&message, e)
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -257,10 +311,20 @@ fn check_view(r: &SignatureReport) -> Check {
         Err(e) => note(false, format!("Firma inválida: {e}.")),
     }
     if r.integrity.is_ok() {
-        if !r.covers_whole_file {
+        if !r.covers_whole_file && r.changes_after.is_empty() {
             note(
                 true,
-                "Se agregó contenido después de esta firma (por ejemplo, otra firma).".into(),
+                "Después de esta firma solo se agregaron otras firmas o datos de validación."
+                    .into(),
+            );
+        }
+        if !r.changes_after.is_empty() {
+            note(
+                false,
+                format!(
+                    "El documento se modificó después de esta firma: {}.",
+                    r.changes_after.join(", ")
+                ),
             );
         }
         if r.trusted {
@@ -296,6 +360,32 @@ fn check_view(r: &SignatureReport) -> Check {
                 ),
                 (Err(e), _) => note(false, format!("Sello de tiempo inválido: {e}.")),
             }
+        } else {
+            note(
+                true,
+                "La hora es la de la computadora de quien firmó (sin sello de tiempo).".into(),
+            );
+        }
+        if r.revoked {
+            note(
+                false,
+                "El certificado estaba revocado cuando se firmó.".into(),
+            );
+        } else if r.revocation.iter().any(|x| {
+            x.finding
+                .is_some_and(|f| matches!(f.status, Status::Revoked(_)))
+        }) {
+            note(
+                true,
+                "El certificado fue revocado después de firmar; la firma sigue valiendo.".into(),
+            );
+        }
+        if r.long_term() {
+            note(
+                true,
+                "Validez a largo plazo: el PDF guarda el estado de los certificados al firmar."
+                    .into(),
+            );
         }
     }
     notes.sort_by_key(|n| n.ok);

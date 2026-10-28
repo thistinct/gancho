@@ -9,8 +9,10 @@ use gancho_card::pkcs11::Module;
 use gancho_core::Signer;
 use gancho_core::appearance::Appearance;
 use gancho_core::ca;
-use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
-use gancho_core::tsp::{HttpTsa, TimestampAuthority};
+use gancho_core::ltv::add_validation_data;
+use gancho_core::pdf::{SignOptions, sign_pdf_lt, sign_pdf_timestamped};
+use gancho_core::revocation::{HttpFetch, Source, Status};
+use gancho_core::tsp::{DEFAULT_TSA_URL, HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use rsa::pkcs1v15::{Signature, VerifyingKey};
 use rsa::pkcs8::DecodePublicKey;
@@ -58,6 +60,30 @@ enum Command {
     Sign(SignArgs),
     /// Check the signatures in a PDF (no card needed).
     Verify(VerifyArgs),
+    /// Add long-term validation data to a PDF that is already signed, for
+    /// every signature in it (no card needed; uses the internet).
+    Ltv(LtvArgs),
+}
+
+#[derive(clap::Args)]
+struct LtvArgs {
+    /// Signed PDF.
+    input: PathBuf,
+    /// Where to write the result (default: `<name>-lt.pdf` next to the
+    /// input).
+    #[arg(short, long)]
+    output: Option<PathBuf>,
+}
+
+/// Where the signing time comes from.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum TimeSource {
+    /// This computer's clock. Verifiers show it as the time the signer
+    /// claims, since nobody else vouches for it.
+    Local,
+    /// A timestamp server (TSA) certifies the time (PAdES-B-T). Needs
+    /// internet access.
+    Tsa,
 }
 
 #[derive(clap::Args)]
@@ -99,10 +125,34 @@ struct SignArgs {
     /// as x1,y1,x2,y2 (implies --visible).
     #[arg(long, value_name = "X1,Y1,X2,Y2", value_parser = parse_rect)]
     rect: Option<[f32; 4]>,
-    /// RFC 3161 timestamp server to certify the signing time (PAdES-B-T),
-    /// e.g. http://timestamp.digicert.com
+    /// Where the signing time comes from: this computer's clock (the
+    /// default), or a timestamp server that certifies it.
+    #[arg(long, value_enum)]
+    time: Option<TimeSource>,
+    /// RFC 3161 timestamp server for `--time tsa` (giving one implies it).
+    /// Default: http://timestamp.digicert.com
     #[arg(long, value_name = "URL")]
     tsa: Option<String>,
+    /// Long-term validity (PAdES-B-LT): store the certificates' revocation
+    /// status (OCSP/CRL) in the PDF so the signature can still be checked
+    /// after the certificate expires. Needs internet access; best combined
+    /// with `--time tsa`.
+    #[arg(long, alias = "ltv")]
+    lt: bool,
+}
+
+impl SignArgs {
+    /// The timestamp server to use, if any.
+    fn tsa_url(&self) -> Result<Option<String>> {
+        match (self.time, &self.tsa) {
+            (Some(TimeSource::Local), Some(_)) => {
+                bail!("--tsa needs --time tsa, not --time local")
+            }
+            (_, Some(url)) => Ok(Some(url.clone())),
+            (Some(TimeSource::Tsa), None) => Ok(Some(DEFAULT_TSA_URL.to_owned())),
+            (Some(TimeSource::Local) | None, None) => Ok(None),
+        }
+    }
 }
 
 fn parse_rect(s: &str) -> std::result::Result<[f32; 4], String> {
@@ -119,8 +169,10 @@ fn parse_rect(s: &str) -> std::result::Result<[f32; 4], String> {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::Verify(args) = &cli.command {
-        return verify(args);
+    match &cli.command {
+        Command::Verify(args) => return verify(args),
+        Command::Ltv(args) => return ltv(args),
+        _ => {}
     }
     let backend = if cli.module.is_some() {
         Backend::Pkcs11
@@ -160,12 +212,13 @@ fn run_native(command: Command, reader: Option<&str>) -> Result<()> {
         }
         Command::SelfTest => self_test(&mut native_signer(reader)?)?,
         Command::Sign(args) => {
-            // Read the PDF before asking for the PIN so a typo in the path
-            // doesn't cost a PIN entry.
+            // Read the PDF and check the options before asking for the PIN
+            // so a typo doesn't cost a PIN entry.
             let input = read_pdf(&args.input)?;
+            args.tsa_url()?;
             sign_file(&mut native_signer(reader)?, &args, &input)?;
         }
-        Command::Verify(_) => unreachable!("handled before connecting"),
+        Command::Verify(_) | Command::Ltv(_) => unreachable!("handled before connecting"),
     }
     Ok(())
 }
@@ -204,12 +257,15 @@ fn run_pkcs11(command: Command, module_path: Option<PathBuf>) -> Result<()> {
         }
         Command::Sign(args) => {
             let input = read_pdf(&args.input)?;
+            args.tsa_url()?;
             let slot = module.first_token()?;
             let pin = rpassword::prompt_password("PIN: ")?;
             let mut signer = module.signer(slot, pin.into())?;
             sign_file(&mut signer, &args, &input)?;
         }
-        Command::Verify(_) => unreachable!("handled before loading the module"),
+        Command::Verify(_) | Command::Ltv(_) => {
+            unreachable!("handled before loading the module")
+        }
     }
     Ok(())
 }
@@ -256,12 +312,57 @@ fn sign_file(signer: &mut dyn Signer, args: &SignArgs, input: &[u8]) -> Result<(
         ),
         ..Default::default()
     };
-    let mut tsa = args.tsa.clone().map(HttpTsa);
+    let tsa_url = args.tsa_url()?;
+    let mut tsa = tsa_url.clone().map(HttpTsa);
     let tsa = tsa.as_mut().map(|t| t as &mut dyn TimestampAuthority);
-    let signed = sign_pdf_timestamped(input, signer, &options, tsa)
-        .with_context(|| format!("signing {}", args.input.display()))?;
+    let context = || format!("signing {}", args.input.display());
+    let signed = if args.lt {
+        let (signed, warnings) =
+            sign_pdf_lt(input, signer, &options, tsa, &mut HttpFetch).with_context(context)?;
+        for w in warnings {
+            eprintln!("note: {w}");
+        }
+        signed
+    } else {
+        sign_pdf_timestamped(input, signer, &options, tsa).with_context(context)?
+    };
     std::fs::write(&output, signed).with_context(|| format!("writing {}", output.display()))?;
     println!("signed: {}", output.display());
+    match &tsa_url {
+        Some(url) => println!("time:   certified by the timestamp server {url}"),
+        None => println!("time:   this computer's clock (not certified by a timestamp server)"),
+    }
+    if args.lt {
+        println!("long-term validation data: included");
+        if tsa_url.is_none() {
+            eprintln!(
+                "note: without --time tsa the revocation data cannot prove the signature was made before a later revocation"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ltv(args: &LtvArgs) -> Result<()> {
+    let pdf = read_pdf(&args.input)?;
+    let output = match &args.output {
+        Some(p) => p.clone(),
+        None => {
+            let stem = args.input.file_stem().unwrap_or_default().to_string_lossy();
+            args.input.with_file_name(format!("{stem}-lt.pdf"))
+        }
+    };
+    let (out, warnings) = add_validation_data(&pdf, &mut HttpFetch)
+        .with_context(|| format!("adding validation data to {}", args.input.display()))?;
+    for w in &warnings {
+        eprintln!("note: {w}");
+    }
+    if out == pdf {
+        println!("nothing to add: the validation data is already there");
+        return Ok(());
+    }
+    std::fs::write(&output, out).with_context(|| format!("writing {}", output.display()))?;
+    println!("written: {}", output.display());
     Ok(())
 }
 
@@ -278,6 +379,9 @@ fn verify(args: &VerifyArgs) -> Result<()> {
     let reports = verify_pdf(&pdf, &anchors, &cas)?;
     if reports.is_empty() {
         bail!("{} has no signatures", args.input.display());
+    }
+    if reports.len() > 1 {
+        println!("{} signatures, oldest first\n", reports.len());
     }
     for (i, r) in reports.iter().enumerate() {
         print_report(i + 1, r);
@@ -307,7 +411,7 @@ fn print_report(n: usize, r: &SignatureReport) {
     }
     if let Some(t) = &r.signed_at {
         let shown = parse_pdf_date(t).map_or_else(|| t.clone(), format_utc);
-        println!("  time:      {shown} (claimed by the signer)");
+        println!("  time:      {shown} (the signer's computer clock, not certified)");
     }
     if let Some(x) = &r.reason {
         println!("  reason:    {x}");
@@ -322,10 +426,14 @@ fn print_report(n: usize, r: &SignatureReport) {
     if r.integrity.is_ok() {
         println!(
             "  coverage:  {}",
-            if r.covers_whole_file {
-                "whole document"
-            } else {
-                "the document was extended after this signature (e.g. another signature)"
+            match (r.covers_whole_file, r.changes_after.is_empty()) {
+                (true, _) => "whole document".to_owned(),
+                (false, true) =>
+                    "ok, later additions are only signatures and validation data".to_owned(),
+                (false, false) => format!(
+                    "FAIL, the document was changed after this signature: {}",
+                    r.changes_after.join(", ")
+                ),
             }
         );
         for c in &r.chain {
@@ -358,6 +466,40 @@ fn print_report(n: usize, r: &SignatureReport) {
             Some(ok) => println!("  dates:     {}", mark(ok)),
             None => println!("  dates:     unknown (no signing time)"),
         }
+        for rev in &r.revocation {
+            let status = match rev.finding {
+                None => "unknown, no revocation data in the PDF".to_owned(),
+                Some(f) => {
+                    let source = match f.source {
+                        Source::Ocsp => "OCSP",
+                        Source::Crl => "CRL",
+                    };
+                    match f.status {
+                        Status::Good => {
+                            format!("no, per {source} of {}", format_utc(f.issued_at))
+                        }
+                        Status::Revoked(at) => format!(
+                            "{} on {} per {source}",
+                            if r.revoked {
+                                "FAIL, revoked"
+                            } else {
+                                "after signing, revoked"
+                            },
+                            format_utc(at)
+                        ),
+                    }
+                }
+            };
+            println!("  revoked:   {status} ({})", rev.subject);
+        }
+        println!(
+            "  long-term: {}",
+            if r.long_term() {
+                "yes, the PDF carries the revocation data"
+            } else {
+                "no"
+            }
+        );
     }
     println!();
 }
