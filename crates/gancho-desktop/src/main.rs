@@ -1,6 +1,7 @@
 //! Gancho desktop: pick a PDF, enter the PIN, sign it with the cédula;
 //! or check the signatures in a PDF. The window is plain HTML in `ui/`;
-//! everything that touches the card or the file runs here.
+//! everything that touches the card or the file runs here. Release builds
+//! also look for a newer version on GitHub Releases at startup.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -15,6 +16,8 @@ use gancho_core::pdf::{SignOptions, sign_pdf_timestamped};
 use gancho_core::tsp::{HttpTsa, TimestampAuthority};
 use gancho_core::verify::{SignatureReport, format_utc, parse_pdf_date, verify_pdf};
 use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+use tauri_plugin_updater::{Update, UpdaterExt};
 
 type Result<T> = std::result::Result<T, UiError>;
 
@@ -320,11 +323,89 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
         .map_err(|e| UiError::with_details("Algo salió mal. Probá de nuevo.", e))?
 }
 
+// --- Updates ---------------------------------------------------------------
+
+/// The update found by `check_update`, kept until the user installs it.
+#[derive(Default)]
+struct PendingUpdate(Mutex<Option<Update>>);
+
+#[derive(Serialize)]
+struct UpdateInfo {
+    version: String,
+    notes: Option<String>,
+}
+
+/// Looks for a newer release. `None` when there is none, when this build
+/// has no updater key (local builds), or when the check fails: being
+/// offline is no reason to bother anyone.
+#[tauri::command]
+async fn check_update(app: AppHandle) -> Option<UpdateInfo> {
+    let pending = app.try_state::<PendingUpdate>()?;
+    let update = match app.updater() {
+        Ok(updater) => updater.check().await,
+        Err(e) => Err(e),
+    };
+    let update = update
+        .inspect_err(|e| eprintln!("gancho: no se pudo buscar actualizaciones ({e})"))
+        .ok()??;
+    let info = UpdateInfo {
+        version: update.version.clone(),
+        notes: non_empty(update.body.clone()),
+    };
+    *pending.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(update);
+    Some(info)
+}
+
+/// Downloads the update found by `check_update`, checks its signature,
+/// installs it and restarts the app.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<()> {
+    let update = app
+        .try_state::<PendingUpdate>()
+        .and_then(|p| p.0.lock().unwrap_or_else(|e| e.into_inner()).take())
+        .ok_or("No hay ninguna actualización para instalar.")?;
+    let bytes = update
+        .download(|_, _| {}, || {})
+        .await
+        .map_err(|e| UiError::with_details("No se pudo descargar la actualización.", e))?;
+    // Not in the middle of a signature: wait for it to finish.
+    let _guard = CARD.lock().unwrap_or_else(|e| e.into_inner());
+    update
+        .install(bytes)
+        .map_err(|e| UiError::with_details("No se pudo instalar la actualización.", e))?;
+    app.restart()
+}
+
+/// Whether this build was given an updater public key (the release
+/// workflow adds it; see `.github/workflows/release.yml`).
+fn updater_configured(config: &tauri::Config) -> bool {
+    config
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|u| u.get("pubkey"))
+        .and_then(|k| k.as_str())
+        .is_some_and(|k| !k.trim().is_empty())
+}
+
 fn main() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![card, default_output, sign, verify])
-        .run(tauri::generate_context!())
+    let context = tauri::generate_context!();
+    let mut builder = tauri::Builder::default().plugin(tauri_plugin_dialog::init());
+    if updater_configured(context.config()) {
+        builder = builder
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .manage(PendingUpdate::default());
+    }
+    builder
+        .invoke_handler(tauri::generate_handler![
+            card,
+            default_output,
+            sign,
+            verify,
+            check_update,
+            install_update
+        ])
+        .run(context)
         .expect("error while running the Gancho window");
 }
 
@@ -371,5 +452,29 @@ mod tests {
             e.message,
             "No se encontró la cédula. Poné la cédula en el lector y tocá Actualizar."
         );
+    }
+
+    #[test]
+    fn updater_needs_a_public_key() {
+        let config = |json: &str| -> tauri::Config {
+            serde_json::from_str(&format!(
+                r#"{{"identifier": "uy.gancho.test", "plugins": {json}}}"#
+            ))
+            .unwrap()
+        };
+        assert!(!updater_configured(&config("{}")));
+        assert!(!updater_configured(&config(
+            r#"{"updater": {"endpoints": ["https://example.com/latest.json"]}}"#
+        )));
+        assert!(!updater_configured(&config(
+            r#"{"updater": {"pubkey": " "}}"#
+        )));
+        assert!(updater_configured(&config(
+            r#"{"updater": {"pubkey": "dW50cnVzdGVk"}}"#
+        )));
+        // The committed configuration has no key: local builds never update.
+        assert!(!updater_configured(
+            &serde_json::from_str(include_str!("../tauri.conf.json")).unwrap()
+        ));
     }
 }

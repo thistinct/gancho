@@ -167,6 +167,31 @@ function renderCheck(c, i) {
   );
 }
 
+// --- Updates --------------------------------------------------------------
+
+// Asks once at startup whether a newer version was released. Rust returns
+// null when there is none or the check failed, so nothing shows then.
+async function checkUpdate() {
+  const update = await invoke("check_update").catch(() => null);
+  if (!update) return;
+  $("update-text").textContent = `Hay una versión nueva de Gancho (${update.version}).`;
+  $("update-text").title = update.notes ?? "";
+  $("update").hidden = false;
+}
+
+async function installUpdate() {
+  $("update-install").disabled = true;
+  $("update-later").hidden = true;
+  $("update-text").className = "muted";
+  $("update-text").textContent = "Descargando la actualización…";
+  try {
+    // Gancho restarts on the new version when this succeeds.
+    await invoke("install_update");
+  } catch (e) {
+    showError($("update-text"), e);
+  }
+}
+
 // --- Wiring ---------------------------------------------------------------
 
 function showTab(name) {
@@ -186,5 +211,8 @@ $("pick-verify").addEventListener("click", pickVerify);
 $("pin").addEventListener("input", updateSignButton);
 $("use-tsa").addEventListener("change", (e) => ($("tsa-row").hidden = !e.target.checked));
 $("sign").addEventListener("submit", sign);
+$("update-install").addEventListener("click", installUpdate);
+$("update-later").addEventListener("click", () => ($("update").hidden = true));
 
 refreshCard();
+checkUpdate();

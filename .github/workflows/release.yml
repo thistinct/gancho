@@ -16,6 +16,19 @@
 #   APPLE_TEAM_ID                with these the app and CLI are notarized
 #   WINDOWS_CERTIFICATE          base64 of a code-signing .pfx
 #   WINDOWS_CERTIFICATE_PASSWORD password of that .pfx
+#
+# Auto-update is optional too. The desktop app checks
+# releases/latest/download/latest.json at startup; the `publish` job writes
+# that manifest when the builds carry an updater signature. Make the key
+# pair once with `tauri signer generate -w ~/.tauri/gancho.key`, then add:
+#
+#   TAURI_SIGNING_PRIVATE_KEY           secret: contents of gancho.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  secret: its password
+#   TAURI_UPDATER_PUBKEY                repository *variable* (not secret):
+#                                       contents of gancho.key.pub
+#
+# Without them the app builds without the updater and never checks. Keep
+# the private key safe: losing it means existing installs cannot update.
 
 name: Release
 
@@ -185,9 +198,32 @@ jobs:
           "TAURI_SIGNING_CONFIG=$configPath" >> $env:GITHUB_ENV
           "WINDOWS_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
 
+      - name: Set up the updater
+        working-directory: crates/gancho-desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$TAURI_UPDATER_PUBKEY" ]; then
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY secret or TAURI_UPDATER_PUBKEY variable not set: this release has no auto-update."
+            exit 0
+          fi
+          # Gives the app the public key it checks updates against, and makes
+          # Tauri sign each installer (`.sig` next to it). Not committed.
+          pubkey=$(printf %s "$TAURI_UPDATER_PUBKEY" | tr -d '[:space:]')
+          printf '{"bundle":{"createUpdaterArtifacts":true},"plugins":{"updater":{"pubkey":"%s"}}}' \
+            "$pubkey" > tauri.updater.json
+          echo "TAURI_UPDATER_CONFIG=tauri.updater.json" >> "$GITHUB_ENV"
+
       - name: Build the desktop app
         working-directory: crates/gancho-desktop
-        run: tauri build ${{ matrix.tauri-args }} ${TAURI_SIGNING_CONFIG:+--config "$TAURI_SIGNING_CONFIG"}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          tauri build ${{ matrix.tauri-args }} \
+            ${TAURI_SIGNING_CONFIG:+--config "$TAURI_SIGNING_CONFIG"} \
+            ${TAURI_UPDATER_CONFIG:+--config "$TAURI_UPDATER_CONFIG"}
 
       - name: Build the CLI
         run: |
@@ -232,6 +268,9 @@ jobs:
 
       - name: Collect the installers
         run: |
+          # With the updater set up, Tauri leaves a `.sig` beside each
+          # installer it can update from; keep it under the published name.
+          sig() { if [ -f "$1.sig" ]; then cp "$1.sig" "dist/$2.sig"; fi; }
           case "$RUNNER_OS" in
             macOS)
               dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg)
@@ -243,15 +282,31 @@ jobs:
                 xcrun stapler staple "$dmg"
               fi
               cp "$dmg" "dist/Gancho-$LABEL-macos-universal.dmg"
+              # The updater replaces the .app with this archive of it.
+              app=target/universal-apple-darwin/release/bundle/macos/Gancho.app.tar.gz
+              if [ -f "$app.sig" ]; then
+                cp "$app" "dist/Gancho-$LABEL-macos-universal.app.tar.gz"
+                sig "$app" "Gancho-$LABEL-macos-universal.app.tar.gz"
+              fi
               ;;
             Windows)
-              cp target/release/bundle/msi/*.msi "dist/Gancho-$LABEL-windows-x64.msi"
-              cp target/release/bundle/nsis/*-setup.exe "dist/Gancho-$LABEL-windows-x64-setup.exe"
+              msi=$(ls target/release/bundle/msi/*.msi)
+              nsis=$(ls target/release/bundle/nsis/*-setup.exe)
+              cp "$msi" "dist/Gancho-$LABEL-windows-x64.msi"
+              cp "$nsis" "dist/Gancho-$LABEL-windows-x64-setup.exe"
+              sig "$msi" "Gancho-$LABEL-windows-x64.msi"
+              sig "$nsis" "Gancho-$LABEL-windows-x64-setup.exe"
               ;;
             Linux)
-              cp target/release/bundle/deb/*.deb "dist/gancho_${LABEL}_amd64.deb"
-              cp target/release/bundle/rpm/*.rpm "dist/gancho-$LABEL.x86_64.rpm"
-              cp target/release/bundle/appimage/*.AppImage "dist/Gancho-$LABEL-linux-x86_64.AppImage"
+              deb=$(ls target/release/bundle/deb/*.deb)
+              rpm=$(ls target/release/bundle/rpm/*.rpm)
+              appimage=$(ls target/release/bundle/appimage/*.AppImage)
+              cp "$deb" "dist/gancho_${LABEL}_amd64.deb"
+              cp "$rpm" "dist/gancho-$LABEL.x86_64.rpm"
+              cp "$appimage" "dist/Gancho-$LABEL-linux-x86_64.AppImage"
+              sig "$deb" "gancho_${LABEL}_amd64.deb"
+              sig "$rpm" "gancho-$LABEL.x86_64.rpm"
+              sig "$appimage" "Gancho-$LABEL-linux-x86_64.AppImage"
               ;;
           esac
           ls -l dist
@@ -271,9 +326,13 @@ jobs:
         if: always() && env.SIGNING_KEYCHAIN != ''
         run: security delete-keychain "$SIGNING_KEYCHAIN"
 
-  checksums:
+  publish:
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      LABEL: ${{ needs.prepare.outputs.label }}
+      TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -281,11 +340,45 @@ jobs:
           merge-multiple: true
 
       - name: Attach SHA256SUMS
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.prepare.outputs.tag }}
+        working-directory: dist
         run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
+          sha256sum $(ls | grep -v '\.sig$') > SHA256SUMS.txt
           cat SHA256SUMS.txt
           gh release upload "$TAG" SHA256SUMS.txt --clobber --repo "$GITHUB_REPOSITORY"
+
+      # The update manifest the desktop app reads from the latest published
+      # release. Each platform points at its installer and that installer's
+      # signature; the app refuses anything not signed with the updater key.
+      # The release is a draft, so nobody is offered it until it is published.
+      - name: Attach the update manifest
+        working-directory: dist
+        run: |
+          if ! ls *.sig >/dev/null 2>&1; then
+            echo "No updater signatures: no latest.json, this release does not auto-update."
+            exit 0
+          fi
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG"
+          platforms='{}'
+          add() { # updater target, file
+            if [ -f "$2.sig" ]; then
+              platforms=$(jq --arg target "$1" --arg url "$base/$2" --rawfile sig "$2.sig" \
+                '.[$target] = {url: $url, signature: ($sig | rtrimstr("\n"))}' <<<"$platforms")
+            fi
+          }
+          # The universal app runs on both Mac architectures.
+          add darwin-aarch64 "Gancho-$LABEL-macos-universal.app.tar.gz"
+          add darwin-x86_64 "Gancho-$LABEL-macos-universal.app.tar.gz"
+          # The app updates with the kind of installer it was installed with
+          # ({os}-{arch}-{installer}), else the plain {os}-{arch} entry.
+          add windows-x86_64 "Gancho-$LABEL-windows-x64-setup.exe"
+          add windows-x86_64-nsis "Gancho-$LABEL-windows-x64-setup.exe"
+          add windows-x86_64-msi "Gancho-$LABEL-windows-x64.msi"
+          add linux-x86_64 "Gancho-$LABEL-linux-x86_64.AppImage"
+          add linux-x86_64-appimage "Gancho-$LABEL-linux-x86_64.AppImage"
+          add linux-x86_64-deb "gancho_${LABEL}_amd64.deb"
+          add linux-x86_64-rpm "gancho-$LABEL.x86_64.rpm"
+          jq -n --arg version "$LABEL" --arg notes "Novedades: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson platforms "$platforms" \
+            '{version: $version, notes: $notes, pub_date: $date, platforms: $platforms}' > latest.json
+          cat latest.json
+          gh release upload "$TAG" latest.json --clobber --repo "$GITHUB_REPOSITORY"
